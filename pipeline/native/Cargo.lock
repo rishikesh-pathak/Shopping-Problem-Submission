@@ -476,6 +476,7 @@ name = "shopping-native"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "hashbrown",
  "memchr",
  "memmap2",
  "parquet",
