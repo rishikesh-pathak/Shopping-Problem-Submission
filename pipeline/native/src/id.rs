@@ -16,6 +16,7 @@ pub trait Identifier<'a>: Copy + Eq + Ord + Hash + Send + Sync + 'a {
     const EMPTY: Self;
     fn encode(text: &'a str) -> std::result::Result<Self, WideIdentifier>;
     fn parquet(self) -> ByteArray;
+    fn radix_key(self) -> Option<u64> { None }
 }
 
 impl<'a> Identifier<'a> for &'a str {
@@ -38,6 +39,7 @@ pub struct PackedId(u64);
 
 impl Identifier<'_> for PackedId {
     const EMPTY: Self = Self(0);
+    fn radix_key(self) -> Option<u64> { Some(self.0) }
 
     fn encode(text: &str) -> std::result::Result<Self, WideIdentifier> {
         let bytes = text.as_bytes();
