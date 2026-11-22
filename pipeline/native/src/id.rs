@@ -16,7 +16,7 @@ pub trait Identifier<'a>: Copy + Eq + Ord + Hash + Send + Sync + 'a {
     const EMPTY: Self;
     fn encode(text: &'a str) -> std::result::Result<Self, WideIdentifier>;
     fn parquet(self) -> ByteArray;
-    fn lex_prefix(self) -> Option<u32> { None }
+    fn lex_prefix(self) -> Option<u64> { None }
 }
 
 impl<'a> Identifier<'a> for &'a str {
@@ -173,6 +173,13 @@ impl<'a> HybridId<'a> {
         // in the memory-mapped dataset; lifetime 'a prevents use after drop.
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
     }
+    fn prefix5(bytes: &[u8]) -> u64 {
+        let mut key = 0u64;
+        for (index, &byte) in bytes.iter().take(5).enumerate() {
+            key |= u64::from(byte) << (8 * (4 - index));
+        }
+        key
+    }
     fn compact_bytes(value: u64) -> ([u8; 9], usize) {
         let mut bytes = [0u8; 9];
         let mut remaining = value;
@@ -198,15 +205,12 @@ impl<'a> Identifier<'a> for HybridId<'a> {
 
     fn encode(text: &'a str) -> std::result::Result<Self, WideIdentifier> {
         let bytes = text.as_bytes();
-        let mut prefix = [0u8; 4];
-        let n = bytes.len().min(4);
-        prefix[..n].copy_from_slice(&bytes[..n]);
         match PackedId::encode(text) {
             Ok(packed) => Ok(Self {
                 value: packed.0,
                 // Cache lexicographic byte prefix in the otherwise unused
                 // compact-ID metadata word. Top bit stays clear for ASCII.
-                len_tag: u32::from_be_bytes(prefix) as u64,
+                len_tag: Self::prefix5(bytes),
                 lifetime: std::marker::PhantomData,
             }),
             Err(_) => Ok(Self {
@@ -224,15 +228,11 @@ impl<'a> Identifier<'a> for HybridId<'a> {
             PackedId(self.value).parquet()
         }
     }
-    fn lex_prefix(self) -> Option<u32> {
+    fn lex_prefix(self) -> Option<u64> {
         if !self.is_wide() {
-            Some(self.len_tag as u32)
+            Some(self.len_tag)
         } else {
-            let bytes = self.wide().as_bytes();
-            let mut prefix = [0u8; 4];
-            let n = bytes.len().min(4);
-            prefix[..n].copy_from_slice(&bytes[..n]);
-            Some(u32::from_be_bytes(prefix))
+            Some(Self::prefix5(self.wide().as_bytes()))
         }
     }
 }
