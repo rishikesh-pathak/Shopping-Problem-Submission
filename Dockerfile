@@ -17,6 +17,10 @@ RUN --mount=type=secret,id=pip_ca --mount=type=bind,from=cargo-registry,target=/
     && cp /src/native/target/release/shopping-native /src/shopping-native
 
 FROM python:3.12-slim-bookworm
+# Test jemalloc against glibc malloc for 8-thread hash/partition workloads.
+RUN apt-get update && apt-get install -y --no-install-recommends libjemalloc2 \
+    && rm -rf /var/lib/apt/lists/*
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY requirements.txt /app/requirements.txt
 RUN --mount=type=secret,id=pip_ca \
