@@ -18,6 +18,9 @@ jobs:
       - name: Install Python comparison tools
         run: python3 -m pip install --break-system-packages polars
       - name: Build submission and run 36 official fixtures
+        env:
+          CPUS: '4'
+          NCPU: '4'
         run: |
           docker build --platform linux/amd64 -t shopping-sessions:latest .
           python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
