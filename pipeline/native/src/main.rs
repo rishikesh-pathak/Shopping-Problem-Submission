@@ -1,13 +1,17 @@
 //! Parallel parser, session engine, and Parquet writer for the submission.
 #[path = "../../csv_input.rs"]
 mod csv_input;
+mod id;
 mod output;
+mod rows;
 
 use ahash::RandomState;
-use csv_input::{digits, input_files, parse_line, stamp};
+use csv_input::{digits, input_files, stamp};
+use id::{Identifier, PackedId, WideIdentifier};
 use memchr::{memchr, memchr_iter};
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
+use rows::for_rows;
 use std::collections::{hash_map::Entry, HashMap};
 use std::error::Error;
 use std::fs::{self, File};
@@ -96,23 +100,6 @@ fn chunks(files: &[Mmap]) -> Vec<&[u8]> {
     chunks
 }
 
-fn for_rows<'a, const N: usize>(
-    bytes: &'a [u8],
-    mut visit: impl FnMut([&'a str; N]) -> Result<()>,
-) -> Result<()> {
-    let mut start = 0;
-    for end in memchr_iter(b'\n', bytes) {
-        if let Some(row) = parse_line(&bytes[start..end]) {
-            visit(row)?;
-        }
-        start = end + 1;
-    }
-    if let Some(row) = parse_line(&bytes[start..]) {
-        visit(row)?;
-    }
-    Ok(())
-}
-
 fn read_dimension(path: &Path) -> Result<String> {
     if fs::metadata(path)?.len() > MAX_DIMENSION_BYTES {
         return Err(UseSql("dimension exceeds native memory budget").into());
@@ -149,15 +136,14 @@ fn dimension<'a>(csv: &'a str, expected_header: &str) -> Result<Map<&'a str, &'a
     Ok(out)
 }
 
-#[derive(Default)]
-struct Links<'a> {
-    index: Map<&'a str, usize>,
-    names: Vec<&'a str>,
+struct Links<K> {
+    index: Map<K, usize>,
+    names: Vec<K>,
     roots: Vec<usize>,
 }
 
-impl<'a> Links<'a> {
-    fn add(&mut self, name: &'a str) -> usize {
+impl<K: Copy + Eq + std::hash::Hash> Links<K> {
+    fn add(&mut self, name: K) -> usize {
         *self.index.entry(name).or_insert_with(|| {
             let index = self.names.len();
             self.names.push(name);
@@ -174,8 +160,15 @@ impl<'a> Links<'a> {
         index
     }
 
-    fn read(files: &'a [Mmap]) -> Result<Map<&'a str, &'a str>> {
-        let mut links = Self::default();
+    fn read<'a>(files: &'a [Mmap]) -> Result<Map<K, K>>
+    where
+        K: Identifier<'a>,
+    {
+        let mut links = Self {
+            index: Map::default(),
+            names: Vec::new(),
+            roots: Vec::new(),
+        };
         for file in files {
             let Some(header) = memchr(b'\n', file) else {
                 continue;
@@ -184,8 +177,8 @@ impl<'a> Links<'a> {
                 if left.is_empty() || right.is_empty() {
                     return Ok(());
                 }
-                let left = links.add(left);
-                let right = links.add(right);
+                let left = links.add(K::encode(left)?);
+                let right = links.add(K::encode(right)?);
                 let left = links.root(left);
                 let right = links.root(right);
                 if links.names[left] < links.names[right] {
@@ -208,42 +201,34 @@ impl<'a> Links<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Event<'a> {
-    user: &'a str,
+struct Event<K> {
+    user: K,
     ms: i64,
     price: u32,
     category: u32,
 }
 
-struct EventCandidate<'a> {
-    id: &'a str,
+struct EventCandidate<K> {
+    id: K,
     ingest: i64,
-    event: Event<'a>,
+    event: Event<K>,
 }
 
-struct Click<'a> {
-    id: &'a str,
-    user: &'a str,
+#[derive(Default)]
+struct EventTimings {
+    deduplication: Duration,
+    identity_lookups: Duration,
+}
+
+struct Click<K> {
+    id: K,
+    user: K,
     ms: i64,
     campaign: u32,
 }
 
-struct IndexedEvent {
-    ms: i64,
-    person: u32,
-    price: u32,
-    category: u32,
-}
-
-struct IndexedClick<'a> {
-    id: &'a str,
-    ms: i64,
-    person: u32,
-    campaign: u32,
-}
-
-struct Input<'a> {
-    identity: Map<&'a str, &'a str>,
+struct Input<'a, K> {
+    identity: Map<K, K>,
     products: Map<&'a str, u32>,
     campaigns: Map<&'a str, u32>,
     start: i64,
@@ -252,16 +237,16 @@ struct Input<'a> {
     hash: RandomState,
 }
 
-impl Input<'_> {
-    fn bucket(&self, id: &str) -> usize {
+impl<'a, K: Identifier<'a>> Input<'a, K> {
+    fn bucket(&self, id: K) -> usize {
         self.hash.hash_one(id) as usize & (PARTITIONS - 1)
     }
 
-    fn person<'a>(&'a self, user: &'a str) -> &'a str {
-        self.identity.get(user).copied().unwrap_or(user)
+    fn person(&self, user: K) -> K {
+        self.identity.get(&user).copied().unwrap_or(user)
     }
 
-    fn events<'a>(&'a self, chunk: &'a [u8]) -> Result<Vec<Vec<EventCandidate<'a>>>> {
+    fn events(&self, chunk: &'a [u8]) -> Result<Vec<Vec<EventCandidate<K>>>> {
         let mut lanes = buckets();
         for_rows(chunk, |[id, user, time, ingest, kind, product, price]| {
             if id.is_empty() {
@@ -269,7 +254,7 @@ impl Input<'_> {
             }
             let ingest = stamp(ingest).ok_or(UseSql("invalid ingest timestamp"))?;
             let mut event = Event {
-                user: "",
+                user: K::EMPTY,
                 ms: 0,
                 price: 0,
                 category: self.unknown,
@@ -282,7 +267,13 @@ impl Input<'_> {
                     && ingest <= ms.saturating_add(DAY)
                 {
                     match kind {
-                        "cart" | "view" => event = Event { user, ms, ..event },
+                        "cart" | "view" => {
+                            event = Event {
+                                user: K::encode(user)?,
+                                ms,
+                                ..event
+                            }
+                        }
                         "purchase" => {
                             if let Some(price) =
                                 digits(price.as_bytes()).filter(|p| (1..=10_000_000).contains(p))
@@ -290,7 +281,7 @@ impl Input<'_> {
                                 let category =
                                     self.products.get(product).copied().unwrap_or(self.unknown);
                                 event = Event {
-                                    user,
+                                    user: K::encode(user)?,
                                     ms,
                                     price: price as u32,
                                     category,
@@ -302,16 +293,19 @@ impl Input<'_> {
                 }
             }
             // Invalid payloads are still candidates for earliest ingest.
+            let id = K::encode(id)?;
             lanes[self.bucket(id)].push(EventCandidate { id, ingest, event });
             Ok(())
         })?;
         Ok(lanes)
     }
 
-    fn dedup_events<'a>(
-        &'a self,
-        chunks: Vec<Vec<EventCandidate<'a>>>,
-    ) -> Result<Vec<Vec<Event<'a>>>> {
+    fn dedup_events(
+        &self,
+        chunks: Vec<Vec<EventCandidate<K>>>,
+        mut timings: Option<&mut EventTimings>,
+    ) -> Result<Vec<Vec<Event<K>>>> {
+        let dedup_started = timings.as_ref().map(|_| Instant::now());
         let count = chunks.iter().map(Vec::len).sum();
         // Each lane shares the partition hash's low bits. Use a separate seed
         // so those bits don't also determine placement inside the dedup table.
@@ -332,17 +326,24 @@ impl Input<'_> {
                 }
             }
         }
+        if let (Some(timing), Some(started)) = (&mut timings, dedup_started) {
+            timing.deduplication = started.elapsed();
+        }
+        let routing_started = timings.as_ref().map(|_| Instant::now());
         let mut lanes = buckets();
         for (_, event) in earliest.into_values() {
-            if !event.user.is_empty() {
+            if event.user != K::EMPTY {
                 let user = self.person(event.user);
                 lanes[self.bucket(user)].push(Event { user, ..event });
             }
         }
+        if let (Some(timing), Some(started)) = (timings, routing_started) {
+            timing.identity_lookups = started.elapsed();
+        }
         Ok(lanes)
     }
 
-    fn clicks<'a>(&'a self, chunk: &'a [u8]) -> Result<Vec<Vec<Click<'a>>>> {
+    fn clicks(&self, chunk: &'a [u8]) -> Result<Vec<Vec<Click<K>>>> {
         let mut lanes = buckets();
         for_rows(chunk, |[id, user, campaign, time]| {
             if id.is_empty() {
@@ -355,9 +356,9 @@ impl Input<'_> {
             // All copies of a click have identical values. Invalid copies can
             // be dropped here, and valid copies land in the same person lane.
             if let Some((ms, campaign)) = valid {
-                let user = self.person(user);
+                let user = self.person(K::encode(user)?);
                 lanes[self.bucket(user)].push(Click {
-                    id,
+                    id: K::encode(id)?,
                     user,
                     ms,
                     campaign,
@@ -385,40 +386,12 @@ fn transpose<T>(chunks: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
     lanes
 }
 
-fn index_people<'a>(
-    event_chunks: Vec<Vec<Event<'a>>>,
-    click_chunks: Vec<Vec<Click<'a>>>,
-) -> (Vec<&'a str>, Vec<IndexedEvent>, Vec<IndexedClick<'a>>) {
-    let mut names = Vec::new();
-    let mut people = Map::default();
-    let mut events = Vec::with_capacity(event_chunks.iter().map(Vec::len).sum());
-    for event in event_chunks.into_iter().flatten() {
-        let person = *people.entry(event.user).or_insert_with(|| {
-            let person = u32::try_from(names.len()).expect("too many people in one lane");
-            names.push(event.user);
-            person
-        });
-        events.push(IndexedEvent {
-            ms: event.ms,
-            person,
-            price: event.price,
-            category: event.category,
-        });
+fn flatten<T>(chunks: Vec<Vec<T>>) -> Vec<T> {
+    let mut rows = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+    for mut chunk in chunks {
+        rows.append(&mut chunk);
     }
-    // A person with clicks but no surviving event can never have a session.
-    let mut clicks = Vec::new();
-    if !people.is_empty() {
-        clicks.reserve(click_chunks.iter().map(Vec::len).sum());
-        clicks.extend(click_chunks.into_iter().flatten().filter_map(|click| {
-            people.get(click.user).copied().map(|person| IndexedClick {
-                id: click.id,
-                ms: click.ms,
-                person,
-                campaign: click.campaign,
-            })
-        }));
-    }
-    (names, events, clicks)
+    rows
 }
 
 #[derive(Default)]
@@ -429,8 +402,8 @@ struct Totals {
     assists: i64,
 }
 
-struct UserDay<'a> {
-    user: &'a str,
+struct UserDay<K> {
+    user: K,
     day: i32,
     sessions: i64,
     events: i64,
@@ -450,15 +423,17 @@ type CampaignTotals = Map<(i32, u32), Totals>;
 struct WorkerTimings {
     sorting: Duration,
     aggregation: Duration,
+    sessionization: Duration,
+    attribution: Duration,
     user_parquet: Duration,
 }
 
-fn sort_clicks(clicks: &mut Vec<IndexedClick<'_>>) {
+fn sort_clicks<K: Ord>(clicks: &mut Vec<Click<K>>) {
     clicks.sort_unstable_by(|a, b| {
-        a.person
-            .cmp(&b.person)
+        a.user
+            .cmp(&b.user)
             .then_with(|| a.ms.cmp(&b.ms))
-            .then_with(|| b.id.cmp(a.id))
+            .then_with(|| b.id.cmp(&a.id))
     });
     // The ordering needed for attribution also makes identical copies adjacent.
     clicks.dedup_by(|a, b| a.id == b.id);
@@ -470,7 +445,7 @@ mod tests {
 
     #[test]
     fn quoted_copies_collapse_without_changing_click_precedence() {
-        let input = Input {
+        let input = Input::<&str> {
             identity: Map::default(),
             products: Map::default(),
             campaigns: [("c1", 1), ("c2", 2)].into_iter().collect(),
@@ -483,29 +458,22 @@ mod tests {
             .clicks(b"k1,u,c1,1000\nk2,u,c2,1000\nk3,click-only,c1,1000\n")
             .unwrap();
         let b = input.clicks(b"\"k1\",\"u\",\"c1\",\"1000\"\n").unwrap();
-        let events = vec![vec![Event {
-            user: "u",
-            ms: 1000,
-            price: 0,
-            category: 0,
-        }]];
-        let (names, _, mut clicks) = index_people(events, a.into_iter().chain(b).collect());
-
+        let mut clicks = flatten(a.into_iter().chain(b).collect());
         sort_clicks(&mut clicks);
-
-        assert_eq!(names, ["u"]);
-        assert_eq!(
-            clicks.iter().map(|row| row.id).collect::<Vec<_>>(),
-            ["k2", "k1"]
-        );
+        let ids: Vec<_> = clicks
+            .iter()
+            .filter(|row| row.user == "u")
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, ["k2", "k1"]);
         assert_eq!(clicks.last().unwrap().campaign, 1);
     }
 }
 
-fn add_user_day<'a>(
-    day: &mut Option<UserDay<'a>>,
+fn add_user_day<K>(
+    day: &mut Option<UserDay<K>>,
     categories: &mut Map<u32, i64>,
-    days: &mut Vec<UserDay<'a>>,
+    days: &mut Vec<UserDay<K>>,
 ) {
     if let Some(mut row) = day.take() {
         // Category indexes were assigned in byte order.
@@ -517,17 +485,17 @@ fn add_user_day<'a>(
     }
 }
 
-fn aggregate<'a>(
-    events: Vec<Vec<Event<'a>>>,
-    clicks: Vec<Vec<Click<'a>>>,
+fn aggregate<K: Copy + Ord>(
+    mut events: Vec<Event<K>>,
+    mut clicks: Vec<Click<K>>,
     organic: u32,
-    days: &mut Vec<UserDay<'a>>,
+    days: &mut Vec<UserDay<K>>,
     campaign_days: &mut CampaignTotals,
+    detail: bool,
     mut timings: Option<&mut WorkerTimings>,
 ) {
-    let (names, mut events, mut clicks) = index_people(events, clicks);
     let sorting_started = timings.as_ref().map(|_| Instant::now());
-    events.sort_unstable_by_key(|event| (event.person, event.ms));
+    events.sort_unstable_by_key(|event| (event.user, event.ms));
     sort_clicks(&mut clicks);
 
     if let (Some(timing), Some(started)) = (&mut timings, sorting_started) {
@@ -537,22 +505,21 @@ fn aggregate<'a>(
     let mut clicks = clicks.as_slice();
     let mut active = Map::<u32, usize>::default();
     let mut categories = Map::<u32, i64>::default();
-    for mut person in events.chunk_by(|a, b| a.person == b.person) {
-        let id = person[0].person;
-        let user = names[id as usize];
-        let n = clicks.iter().take_while(|click| click.person == id).count();
+    for mut person in events.chunk_by(|a, b| a.user == b.user) {
+        let user = person[0].user;
+        let preceding = clicks.iter().take_while(|click| click.user < user).count();
+        clicks = &clicks[preceding..];
+        let n = clicks.iter().take_while(|click| click.user == user).count();
         let (touches, rest) = clicks.split_at(n);
         clicks = rest;
         active.clear();
         let (mut left, mut right) = (0, 0);
         let mut day = None;
         while let Some(first) = person.first() {
+            let session_started = detail.then(Instant::now);
             let ms = first.ms;
             let date = ms.div_euclid(DAY) as i32;
-            if day
-                .as_ref()
-                .is_some_and(|row: &UserDay<'_>| row.day != date)
-            {
+            if day.as_ref().is_some_and(|row: &UserDay<K>| row.day != date) {
                 add_user_day(&mut day, &mut categories, days);
             }
             let row = day.get_or_insert(UserDay {
@@ -584,6 +551,10 @@ fn aggregate<'a>(
             row.events += count as i64;
             row.revenue += revenue;
 
+            if let (Some(timing), Some(started)) = (&mut timings, session_started) {
+                timing.sessionization += started.elapsed();
+            }
+            let attribution_started = detail.then(Instant::now);
             let cutoff = ms.saturating_sub(WEEK);
             while left < right && touches[left].ms < cutoff {
                 if let Entry::Occupied(mut count) = active.entry(touches[left].campaign) {
@@ -613,6 +584,9 @@ fn aggregate<'a>(
             totals.revenue += revenue;
             for &campaign in active.keys() {
                 campaign_days.entry((date, campaign)).or_default().assists += 1;
+            }
+            if let (Some(timing), Some(started)) = (&mut timings, attribution_started) {
+                timing.attribution += started.elapsed();
             }
         }
         add_user_day(&mut day, &mut categories, days);
@@ -648,177 +622,246 @@ fn run() -> Result<()> {
         return Err(UseSql("manifest date range requires SQL").into());
     }
 
-    let products = read_dimension(&data.join("products.csv"))?;
-    let products = dimension(&products, "product_id,category")?;
-    let campaign_csv = read_dimension(&data.join("campaigns.csv"))?;
-    let campaign_dim = dimension(&campaign_csv, "campaign_id,channel")?;
-    let mut categories: Vec<_> = products.values().copied().chain(["unknown"]).collect();
-    categories.sort_unstable();
-    categories.dedup();
-    let category_ids: Map<_, _> = categories
-        .iter()
-        .enumerate()
-        .map(|(i, &name)| (name, i as u32))
-        .collect();
-    let mut campaign_names: Vec<_> = campaign_dim
-        .iter()
-        .map(|(&name, &channel)| (name, channel))
-        .collect();
-    let campaigns: Map<_, _> = campaign_names
-        .iter()
-        .enumerate()
-        .map(|(i, &(name, _))| (name, i as u32))
-        .collect();
-    let organic = campaign_names.len() as u32;
-    campaign_names.push(("organic", "organic"));
-    let organic = *campaigns.get("organic").unwrap_or(&organic);
-    // Synthetic organic must not turn an otherwise unknown click campaign into a valid one.
-    if let Some(campaign) = campaign_names.get_mut(organic as usize) {
-        campaign.1 = "organic";
-    }
-
-    let links = data_files(&data.join("links"))?;
-    let events = data_files(&data.join("events"))?;
-    let clicks = data_files(&data.join("clicks"))?;
-    let memory_budget = env_usize("MEM_GB", 24) as u128 * 860_000_000;
-    let bytes = [&links, &events, &clicks]
-        .into_iter()
-        .flatten()
-        .map(|file| file.len() as u128)
-        .sum::<u128>();
-    if bytes >= memory_budget {
-        return Err(UseSql("input exceeds native memory budget").into());
-    }
-    let event_chunks = chunks(&events);
-    let click_chunks = chunks(&clicks);
-    let ((event_rows, click_rows), link_rows) = rayon::join(
-        || rayon::join(|| row_bound(&event_chunks), || row_bound(&click_chunks)),
-        || row_bound(&chunks(&links)),
-    );
-    // Allow for mapped input, per-record partition buffers, hash tables, and
-    // Parquet writers. Leave headroom for allocator and runtime overhead.
-    let estimated = bytes
-        + event_rows as u128 * 175
-        + click_rows as u128 * 130
-        + link_rows as u128 * 192
-        + (1 << 30);
-    if estimated > memory_budget {
-        return Err(UseSql("input exceeds native memory budget").into());
-    }
-    let identity = Links::read(&links)?;
-    let input = Input {
-        identity,
-        products: products
-            .into_iter()
-            .map(|(id, category)| (id, category_ids[category]))
-            .collect(),
-        campaigns,
+    let files = Dataset {
+        links: data_files(&data.join("links"))?,
+        events: data_files(&data.join("events"))?,
+        clicks: data_files(&data.join("clicks"))?,
+        products: read_dimension(&data.join("products.csv"))?,
+        campaigns: read_dimension(&data.join("campaigns.csv"))?,
         start,
         end,
-        unknown: category_ids["unknown"],
-        hash: RandomState::new(),
     };
-    lap("map input and identity links");
-    let events = event_chunks
-        .par_iter()
-        .map(|chunk| input.events(chunk))
-        .collect::<Result<_>>()?;
-    lap("parse and partition events");
-    let events = transpose(events)
-        .into_par_iter()
-        .map(|lane| input.dedup_events(lane))
-        .collect::<Result<_>>()?;
-    let events = transpose(events);
-    lap("deduplicate and link events");
-    let clicks = click_chunks
-        .par_iter()
-        .map(|chunk| input.clicks(chunk))
-        .collect::<Result<_>>()?;
-    let clicks = transpose(clicks);
+    lap("open inputs and initialize workers");
+    match files.process::<PackedId>(&out, threads, profiling) {
+        Err(error) if error.is::<WideIdentifier>() => {
+            if profiling {
+                eprintln!("[PROFILE] Retrying with full-width identifiers");
+            }
+            files.process::<&str>(&out, threads, profiling)
+        }
+        result => result,
+    }
+}
 
-    lap("parse and link clicks");
-    let users_dir = out.join("user_daily");
-    let campaigns_dir = out.join("campaign_daily");
-    fs::create_dir_all(&users_dir)?;
-    fs::create_dir_all(&campaigns_dir)?;
-    let workers = event_rows
-        .div_ceil(250_000)
-        .clamp(1, threads.min(PARTITIONS));
-    let mut work: Vec<_> = (0..workers).map(|_| Vec::new()).collect();
-    for (index, partitions) in events.into_iter().zip(clicks).enumerate() {
-        work[index % workers].push(partitions);
-    }
-    let totals = work
-        .into_par_iter()
-        .enumerate()
-        .map(|(worker, lanes)| {
-            let mut days = Vec::new();
-            let mut totals = Map::default();
-            let mut timings = profiling.then(WorkerTimings::default);
-            for (events, clicks) in lanes {
-                aggregate(
-                    events,
-                    clicks,
-                    organic,
-                    &mut days,
-                    &mut totals,
-                    timings.as_mut(),
-                );
-            }
-            let write_started = profiling.then(Instant::now);
-            output::users(
-                &users_dir.join(format!("part-{worker}.parquet")),
-                &categories,
-                &days,
-            )?;
-            if let (Some(timing), Some(started)) = (&mut timings, write_started) {
-                timing.user_parquet = started.elapsed();
-            }
-            Ok((totals, timings))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    lap("sort, sessionize, attribute, and write user Parquet");
-    let mut combined = CampaignTotals::default();
-    let mut slowest = WorkerTimings::default();
-    for (map, timings) in totals {
-        if let Some(timing) = timings {
-            slowest.sorting = slowest.sorting.max(timing.sorting);
-            slowest.aggregation = slowest.aggregation.max(timing.aggregation);
-            slowest.user_parquet = slowest.user_parquet.max(timing.user_parquet);
+struct Dataset {
+    links: Vec<Mmap>,
+    events: Vec<Mmap>,
+    clicks: Vec<Mmap>,
+    products: String,
+    campaigns: String,
+    start: i64,
+    end: i64,
+}
+
+impl Dataset {
+    fn process<'a, K: Identifier<'a>>(
+        &'a self,
+        out: &Path,
+        threads: usize,
+        profiling: bool,
+    ) -> Result<()> {
+        let mut lap = profile(profiling);
+        let detail = profiling && env::var("SHOPPING_PROFILE_DETAIL").as_deref() == Ok("1");
+        let products = dimension(&self.products, "product_id,category")?;
+        let campaign_dim = dimension(&self.campaigns, "campaign_id,channel")?;
+        let mut categories: Vec<_> = products.values().copied().chain(["unknown"]).collect();
+        categories.sort_unstable();
+        categories.dedup();
+        let category_ids: Map<_, _> = categories
+            .iter()
+            .enumerate()
+            .map(|(i, &name)| (name, i as u32))
+            .collect();
+        let mut campaign_names: Vec<_> = campaign_dim
+            .iter()
+            .map(|(&name, &channel)| (name, channel))
+            .collect();
+        let campaigns: Map<_, _> = campaign_names
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, _))| (name, i as u32))
+            .collect();
+        let organic = campaign_names.len() as u32;
+        campaign_names.push(("organic", "organic"));
+        let organic = *campaigns.get("organic").unwrap_or(&organic);
+        // Synthetic organic must not turn an otherwise unknown click campaign into a valid one.
+        if let Some(campaign) = campaign_names.get_mut(organic as usize) {
+            campaign.1 = "organic";
         }
-        for (key, totals) in map {
-            let target = combined.entry(key).or_default();
-            target.sessions += totals.sessions;
-            target.purchases += totals.purchases;
-            target.revenue += totals.revenue;
-            target.assists += totals.assists;
+
+        let memory_budget = env_usize("MEM_GB", 24) as u128 * 860_000_000;
+        let bytes = [&self.links, &self.events, &self.clicks]
+            .into_iter()
+            .flatten()
+            .map(|file| file.len() as u128)
+            .sum::<u128>();
+        if bytes >= memory_budget {
+            return Err(UseSql("input exceeds native memory budget").into());
         }
-    }
-    if profiling {
-        // Worker phases overlap. These maxima are useful separately and do not sum.
-        eprintln!(
-            "[PROFILE] Max worker times: sort {:.3}s, aggregate {:.3}s, user Parquet {:.3}s",
-            slowest.sorting.as_secs_f64(),
-            slowest.aggregation.as_secs_f64(),
-            slowest.user_parquet.as_secs_f64()
+        let event_chunks = chunks(&self.events);
+        let click_chunks = chunks(&self.clicks);
+        let ((event_rows, click_rows), link_rows) = rayon::join(
+            || rayon::join(|| row_bound(&event_chunks), || row_bound(&click_chunks)),
+            || row_bound(&chunks(&self.links)),
         );
+        // Allow for mapped input, per-record partition buffers, hash tables, and
+        // Parquet writers. Leave headroom for allocator and runtime overhead.
+        let estimated = bytes
+            + event_rows as u128 * 175
+            + click_rows as u128 * 130
+            + link_rows as u128 * 192
+            + (1 << 30);
+        if estimated > memory_budget {
+            return Err(UseSql("input exceeds native memory budget").into());
+        }
+        lap("count input rows and plan memory");
+        let identity = Links::<K>::read(&self.links)?;
+        let input = Input {
+            identity,
+            products: products
+                .into_iter()
+                .map(|(id, category)| (id, category_ids[category]))
+                .collect(),
+            campaigns,
+            start: self.start,
+            end: self.end,
+            unknown: category_ids["unknown"],
+            hash: RandomState::new(),
+        };
+        lap("build identity map");
+        let events = event_chunks
+            .par_iter()
+            .map(|chunk| input.events(chunk))
+            .collect::<Result<_>>()?;
+        lap("parse and partition events");
+        let partitions = transpose(events)
+            .into_par_iter()
+            .map(|lane| {
+                let mut timing = detail.then(EventTimings::default);
+                let rows = input.dedup_events(lane, timing.as_mut())?;
+                Ok((rows, timing))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut event_timings = EventTimings::default();
+        let events = partitions
+            .into_iter()
+            .map(|(rows, timing)| {
+                if let Some(timing) = timing {
+                    event_timings.deduplication += timing.deduplication;
+                    event_timings.identity_lookups += timing.identity_lookups;
+                }
+                rows
+            })
+            .collect();
+        let events = transpose(events);
+        lap("deduplicate and link events");
+        if detail {
+            eprintln!(
+                "[PROFILE] Total partition time: deduplication {:.3}s, identity lookup and routing {:.3}s",
+                event_timings.deduplication.as_secs_f64(),
+                event_timings.identity_lookups.as_secs_f64()
+            );
+        }
+        let clicks = click_chunks
+            .par_iter()
+            .map(|chunk| input.clicks(chunk))
+            .collect::<Result<_>>()?;
+        let clicks = transpose(clicks);
+
+        lap("parse and link clicks");
+        let users_dir = out.join("user_daily");
+        let campaigns_dir = out.join("campaign_daily");
+        fs::create_dir_all(&users_dir)?;
+        fs::create_dir_all(&campaigns_dir)?;
+        let workers = event_rows
+            .div_ceil(250_000)
+            .clamp(1, threads.min(PARTITIONS));
+        let mut work: Vec<_> = (0..workers).map(|_| Vec::new()).collect();
+        for (index, partitions) in events.into_iter().zip(clicks).enumerate() {
+            work[index % workers].push(partitions);
+        }
+        let totals = work
+            .into_par_iter()
+            .enumerate()
+            .map(|(worker, lanes)| {
+                let mut days = Vec::new();
+                let mut totals = Map::default();
+                let mut timings = profiling.then(WorkerTimings::default);
+                for (events, clicks) in lanes {
+                    aggregate(
+                        flatten(events),
+                        flatten(clicks),
+                        organic,
+                        &mut days,
+                        &mut totals,
+                        detail,
+                        timings.as_mut(),
+                    );
+                }
+                let write_started = profiling.then(Instant::now);
+                output::users(
+                    &users_dir.join(format!("part-{worker}.parquet")),
+                    &categories,
+                    &days,
+                )?;
+                if let (Some(timing), Some(started)) = (&mut timings, write_started) {
+                    timing.user_parquet = started.elapsed();
+                }
+                Ok((totals, timings))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        lap("sort, sessionize, attribute, and write user Parquet");
+        let mut combined = CampaignTotals::default();
+        let mut slowest = WorkerTimings::default();
+        for (map, timings) in totals {
+            if let Some(timing) = timings {
+                slowest.sorting = slowest.sorting.max(timing.sorting);
+                slowest.aggregation = slowest.aggregation.max(timing.aggregation);
+                slowest.sessionization = slowest.sessionization.max(timing.sessionization);
+                slowest.attribution = slowest.attribution.max(timing.attribution);
+                slowest.user_parquet = slowest.user_parquet.max(timing.user_parquet);
+            }
+            for (key, totals) in map {
+                let target = combined.entry(key).or_default();
+                target.sessions += totals.sessions;
+                target.purchases += totals.purchases;
+                target.revenue += totals.revenue;
+                target.assists += totals.assists;
+            }
+        }
+        if profiling {
+            // Worker phases overlap. These maxima are useful separately and do not sum.
+            eprintln!(
+                "[PROFILE] Max worker times: sort {:.3}s, aggregate {:.3}s, user Parquet {:.3}s",
+                slowest.sorting.as_secs_f64(),
+                slowest.aggregation.as_secs_f64(),
+                slowest.user_parquet.as_secs_f64()
+            );
+        }
+        if detail {
+            eprintln!(
+                "[PROFILE] Max worker times: sessionization {:.3}s, campaign attribution and assists {:.3}s",
+                slowest.sessionization.as_secs_f64(),
+                slowest.attribution.as_secs_f64()
+            );
+        }
+        let rows: Vec<_> = combined
+            .into_iter()
+            .map(|((day, campaign), totals)| CampaignDay {
+                campaign,
+                day,
+                totals,
+            })
+            .collect();
+        output::campaigns(
+            &campaigns_dir.join("part-0.parquet"),
+            &campaign_names,
+            &rows,
+        )?;
+        output::remove_unused_user_parts(&users_dir, workers)?;
+        lap("merge campaign totals and finish outputs");
+        Ok(())
     }
-    let rows: Vec<_> = combined
-        .into_iter()
-        .map(|((day, campaign), totals)| CampaignDay {
-            campaign,
-            day,
-            totals,
-        })
-        .collect();
-    output::campaigns(
-        &campaigns_dir.join("part-0.parquet"),
-        &campaign_names,
-        &rows,
-    )?;
-    output::remove_unused_user_parts(&users_dir, workers)?;
-    lap("merge campaign totals and finish outputs");
-    Ok(())
 }
 
 fn main() -> ExitCode {
