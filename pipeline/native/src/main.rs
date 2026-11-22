@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use std::{env, fmt, io};
 
-const PARTITIONS: usize = 128;
+const PARTITIONS: usize = 64;
 const CHUNK_BYTES: usize = 2 * 1024 * 1024;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
