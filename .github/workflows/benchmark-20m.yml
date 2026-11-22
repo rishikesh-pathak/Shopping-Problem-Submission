@@ -1,0 +1,46 @@
+name: Compare 20M Docker cold start times
+on:
+  push:
+    branches:
+      - perf/streaming-utf8-check
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build 20M event dataset
+        run: |
+          mkdir -p /tmp/shop-gen
+          curl --retry 3 -fsSL https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o /tmp/shop-gen.zip
+          unzip -q /tmp/shop-gen.zip -d /tmp/shop-gen
+          GEN=$(find /tmp/shop-gen -name Cargo.toml -print -quit)
+          test -n "$GEN"
+          cargo run --release --manifest-path "$GEN" -- --seed 17 --events 20000000 --clicks 5000000 --output /tmp/shop-20m
+      - name: Build baseline and experimental images
+        run: |
+          git worktree add --detach /tmp/shop-baseline f389b6d5029f9160298318810f240f1ea2b834da
+          docker build --platform linux/amd64 -t shopping-base /tmp/shop-baseline
+          docker build --platform linux/amd64 -t shopping-new .
+      - name: Measure alternating complete Docker runs
+        env:
+          CPUS: '4'
+          NCPU: '4'
+          MEM: '14g'
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, tempfile, time
+          for repeat, images in enumerate((("shopping-base", "shopping-new"), ("shopping-new", "shopping-base"))):
+              for image in images:
+                  with tempfile.TemporaryDirectory() as out:
+                      env = dict(os.environ, IMAGE=image)
+                      start = time.perf_counter()
+                      subprocess.run(["scripts/docker_run.sh", "/tmp/shop-20m", out], env=env, check=True)
+                      elapsed = time.perf_counter() - start
+                      print(f"MEASURE repeat={repeat+1} image={image} cold-container-wall={elapsed:.3f}s", flush=True)
+          PY
