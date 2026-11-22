@@ -1,0 +1,66 @@
+name: Verify two-pass Bloom duplicate detector
+on:
+  push:
+    branches:
+      - perf/bloom-dedup
+  workflow_dispatch:
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CPUS: '4'
+      NCPU: '4'
+      MEM: '14g'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install comparison tools
+        run: python3 -m pip install --break-system-packages polars
+      - name: Rust unit tests
+        run: cargo test --release --locked --manifest-path pipeline/native/Cargo.toml
+      - name: Build experimental image
+        run: docker build --platform linux/amd64 -t shopping-new .
+      - name: Test 36 official fixtures
+        env:
+          IMAGE: shopping-new
+        run: python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+      - name: Download official generator and reference
+        run: |
+          mkdir -p /tmp/shop-gen /tmp/shop-answer
+          curl --retry 3 -fsSL https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o /tmp/gen.zip
+          curl --retry 3 -fsSL https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/dev-answer.zip -o /tmp/ans.zip
+          unzip -q /tmp/gen.zip -d /tmp/shop-gen
+          unzip -q /tmp/ans.zip -d /tmp/shop-answer
+      - name: Verify official 1M tables
+        env:
+          IMAGE: shopping-new
+        run: |
+          GEN=$(find /tmp/shop-gen -name Cargo.toml -print -quit)
+          cargo run --release --manifest-path "$GEN" -- --seed 1 --events 1000000 --clicks 250000 --output /tmp/shop-dev
+          mkdir -p /tmp/shop-dev-out
+          scripts/docker_run.sh /tmp/shop-dev /tmp/shop-dev-out
+          ANSWER=$(find /tmp/shop-answer -name user_daily.csv -print -quit)
+          python3 scripts/compare.py /tmp/shop-dev-out "$(dirname "$ANSWER")"
+      - name: Build matched 20M reference
+        run: |
+          GEN=$(find /tmp/shop-gen -name Cargo.toml -print -quit)
+          cargo run --release --manifest-path "$GEN" -- --seed 17 --events 20000000 --clicks 5000000 --output /tmp/shop-20m
+          git worktree add --detach /tmp/shop-base 0cbadb0bd28023877bd6e69abe6300a2880f1a17
+          docker build --platform linux/amd64 -t shopping-base /tmp/shop-base
+      - name: Compare complete Docker runs
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, tempfile, time
+          for repeat, images in enumerate((("shopping-base", "shopping-new"), ("shopping-new", "shopping-base"))):
+              for image in images:
+                  with tempfile.TemporaryDirectory() as out:
+                      env = dict(os.environ, IMAGE=image)
+                      start = time.perf_counter()
+                      subprocess.run(["scripts/docker_run.sh", "/tmp/shop-20m", out], env=env, check=True)
+                      elapsed = time.perf_counter() - start
+                      print(f"MEASURE repeat={repeat+1} image={image} cold-container-wall={elapsed:.3f}s", flush=True)
+          PY
