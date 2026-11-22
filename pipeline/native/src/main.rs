@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use std::{env, fmt, io};
 
 const PARTITIONS: usize = 128;
-const CHUNK_BYTES: usize = 2 * 1024 * 1024;
+const CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const SESSION_GAP: i64 = 1_800_000;
