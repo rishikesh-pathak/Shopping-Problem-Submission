@@ -12,7 +12,7 @@ use memchr::memchr;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use rows::for_rows;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -203,6 +203,7 @@ struct Event<K> {
 
 struct EventCandidate<K> {
     id: K,
+    hash: u64,
     ingest: i64,
     event: Event<K>,
 }
@@ -288,7 +289,8 @@ impl<'a, K: Identifier<'a>> Input<'a, K> {
             }
             // Invalid payloads are still candidates for earliest ingest.
             let id = K::encode(id)?;
-            lanes[self.bucket(id)].push(EventCandidate { id, ingest, event });
+            let hash = self.hash.hash_one(id);
+            lanes[hash as usize & (PARTITIONS - 1)].push(EventCandidate { id, hash, ingest, event });
             Ok(())
         })?;
         Ok(lanes)
@@ -300,31 +302,55 @@ impl<'a, K: Identifier<'a>> Input<'a, K> {
         mut timings: Option<&mut EventTimings>,
     ) -> Result<Vec<Vec<Event<K>>>> {
         let dedup_started = timings.as_ref().map(|_| Instant::now());
-        let count = chunks.iter().map(Vec::len).sum();
-        // Each lane shares the partition hash's low bits. Use a separate seed
-        // so those bits don't also determine placement inside the dedup table.
-        let mut earliest = Map::with_capacity_and_hasher(count, RandomState::new());
-        for EventCandidate { id, ingest, event } in chunks.into_iter().flatten() {
-            match earliest.entry(id) {
-                Entry::Vacant(slot) => {
-                    slot.insert((ingest, event));
-                }
-                Entry::Occupied(mut slot) => {
-                    let (previous, previous_event) = slot.get();
-                    if ingest == *previous && event != *previous_event {
-                        return Err(UseSql("event ID and ingest timestamp tie").into());
-                    }
-                    if ingest < *previous {
-                        slot.insert((ingest, event));
-                    }
-                }
+        // Exact two-pass candidate dedup: a Bloom filter marks hashes that
+        // might have duplicates, and only those hashes enter the full-key
+        // earliest-ingest hashmap. Bloom false positives affect speed only.
+        //
+        // Identical identifiers always have identical hashes and land in
+        // the same partition, so a repeated ID can never be missed.
+        let total: usize = chunks.iter().map(Vec::len).sum();
+        let bits = total.saturating_mul(16).next_power_of_two().clamp(1 << 16, 1 << 24);
+        let mask = bits - 1;
+        let mut seen = vec![0_u64; bits / 64];
+        let mut maybe_repeated: HashSet<u64, RandomState> = HashSet::default();
+        for row in chunks.iter().flatten() {
+            if bloom_mark(&mut seen, row.hash, mask) {
+                maybe_repeated.insert(row.hash);
             }
         }
+        let mut repeated = vec![0_u64; bits / 64];
+        for &hash in &maybe_repeated {
+            bloom_mark(&mut repeated, hash, mask);
+        }
+        let mut earliest = Map::<K, (i64, Event<K>)>::with_capacity_and_hasher(
+            maybe_repeated.len().saturating_mul(2),
+            RandomState::new(),
+        );
+        let mut lanes = buckets();
         if let (Some(timing), Some(started)) = (&mut timings, dedup_started) {
             timing.deduplication = started.elapsed();
         }
         let routing_started = timings.as_ref().map(|_| Instant::now());
-        let mut lanes = buckets();
+        for EventCandidate { id, hash, ingest, event } in chunks.into_iter().flatten() {
+            // Most unique IDs bypass the map entirely.
+            if bloom_has(&repeated, hash, mask) && maybe_repeated.contains(&hash) {
+                match earliest.entry(id) {
+                    Entry::Vacant(slot) => { slot.insert((ingest, event)); }
+                    Entry::Occupied(mut slot) => {
+                        let (previous, previous_event) = slot.get();
+                        if ingest == *previous && event != *previous_event {
+                            return Err(UseSql("event ID and ingest timestamp tie").into());
+                        }
+                        if ingest < *previous {
+                            slot.insert((ingest, event));
+                        }
+                    }
+                }
+            } else if event.user != K::EMPTY {
+                let user = self.person(event.user);
+                lanes[self.bucket(user)].push(Event { user, ..event });
+            }
+        }
         for (_, event) in earliest.into_values() {
             if event.user != K::EMPTY {
                 let user = self.person(event.user);
@@ -362,6 +388,33 @@ impl<'a, K: Identifier<'a>> Input<'a, K> {
         })?;
         Ok(lanes)
     }
+}
+
+// Two hash-derived bit positions. The hash is fixed for a given identifier
+// within this run, so duplicates are never false negatives.
+#[inline(always)]
+fn bloom_slots(hash: u64, mask: usize) -> (usize, usize) {
+    let a = hash >> 7;
+    let b = hash.rotate_left(29) ^ (hash >> 31);
+    (a as usize & mask, b as usize & mask)
+}
+
+#[inline(always)]
+fn bloom_mark(words: &mut [u64], hash: u64, mask: usize) -> bool {
+    let (a, b) = bloom_slots(hash, mask);
+    let (ai, bi) = (a >> 6, b >> 6);
+    let (abit, bbit) = (1u64 << (a & 63), 1u64 << (b & 63));
+    let found = words[ai] & abit != 0 && words[bi] & bbit != 0;
+    words[ai] |= abit;
+    words[bi] |= bbit;
+    found
+}
+
+#[inline(always)]
+fn bloom_has(words: &[u64], hash: u64, mask: usize) -> bool {
+    let (a, b) = bloom_slots(hash, mask);
+    words[a >> 6] & (1u64 << (a & 63)) != 0 &&
+        words[b >> 6] & (1u64 << (b & 63)) != 0
 }
 
 fn buckets<T>() -> Vec<Vec<T>> {
