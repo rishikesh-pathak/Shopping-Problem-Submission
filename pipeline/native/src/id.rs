@@ -232,10 +232,10 @@ impl<'a> Eq for HybridId<'a> {}
 impl<'a> std::hash::Hash for HybridId<'a> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         if self.is_wide() {
-            1u8.hash(state);
             self.wide().hash(state);
         } else {
-            0u8.hash(state);
+            // Compact IDs are unequal to wide IDs by construction.
+            // One u64 hash write is sufficient and keeps the hot path lean.
             self.value.hash(state);
         }
     }
