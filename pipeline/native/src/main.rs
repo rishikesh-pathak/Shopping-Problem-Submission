@@ -7,7 +7,7 @@ mod rows;
 
 use ahash::RandomState;
 use csv_input::{digits, input_files, stamp};
-use id::{Identifier, PackedId, WideIdentifier};
+use id::{HybridId, Identifier, WideIdentifier};
 use memchr::{memchr, memchr_iter};
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
@@ -632,15 +632,9 @@ fn run() -> Result<()> {
         end,
     };
     lap("open inputs and initialize workers");
-    match files.process::<PackedId>(&out, threads, profiling) {
-        Err(error) if error.is::<WideIdentifier>() => {
-            if profiling {
-                eprintln!("[PROFILE] Retrying with full-width identifiers");
-            }
-            files.process::<&str>(&out, threads, profiling)
-        }
-        result => result,
-    }
+    // HybridId handles packed short and arbitrary-width UTF-8 IDs without
+    // discarding parsed work and restarting on the first long identifier.
+    files.process::<HybridId<'_>>(&out, threads, profiling)
 }
 
 struct Dataset {
