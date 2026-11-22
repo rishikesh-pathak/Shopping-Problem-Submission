@@ -485,7 +485,47 @@ fn add_user_day<K>(
     }
 }
 
-fn aggregate<K: Copy + Ord>(
+// Stable LSD radix ordering by compact user IDs. A final short per-user
+// timestamp sort preserves the original (person, event-time) order exactly.
+// Full-width identifiers continue using the comparison-sort reference path.
+fn sort_user_events<'a, K: Identifier<'a>>(events: &mut Vec<Event<K>>) {
+    if events.len() < 1_024 || events[0].user.radix_key().is_none() {
+        events.sort_unstable_by_key(|event| (event.user, event.ms));
+        return;
+    }
+    let first = events[0].user.radix_key().unwrap();
+    let mut variation = 0_u64;
+    for event in events.iter() {
+        variation |= event.user.radix_key().unwrap() ^ first;
+    }
+    let mut buffer = events.clone();
+    for shift in (0..64).step_by(11) {
+        if (variation >> shift) & 2047 == 0 {
+            continue;
+        }
+        let mut counts = [0_usize; 2048];
+        for event in events.iter() {
+            counts[((event.user.radix_key().unwrap() >> shift) & 2047) as usize] += 1;
+        }
+        let mut at = 0;
+        for count in &mut counts {
+            let size = *count;
+            *count = at;
+            at += size;
+        }
+        for event in events.iter() {
+            let index = ((event.user.radix_key().unwrap() >> shift) & 2047) as usize;
+            buffer[counts[index]] = *event;
+            counts[index] += 1;
+        }
+        std::mem::swap(events, &mut buffer);
+    }
+    for group in events.chunk_by_mut(|left, right| left.user == right.user) {
+        group.sort_unstable_by_key(|event| event.ms);
+    }
+}
+
+fn aggregate<'a, K: Identifier<'a>>(
     mut events: Vec<Event<K>>,
     mut clicks: Vec<Click<K>>,
     organic: u32,
@@ -495,7 +535,7 @@ fn aggregate<K: Copy + Ord>(
     mut timings: Option<&mut WorkerTimings>,
 ) {
     let sorting_started = timings.as_ref().map(|_| Instant::now());
-    events.sort_unstable_by_key(|event| (event.user, event.ms));
+    sort_user_events(&mut events);
     sort_clicks(&mut clicks);
 
     if let (Some(timing), Some(started)) = (&mut timings, sorting_started) {
