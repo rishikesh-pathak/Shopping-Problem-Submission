@@ -55,7 +55,7 @@ pub fn remove_unused_user_parts(dir: &Path, files_written: usize) -> Result<()> 
 fn writer(path: &Path, schema: &str) -> Result<SerializedFileWriter<File>> {
     let schema = Arc::new(parse_message_type(schema)?);
     let properties = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(Compression::UNCOMPRESSED)
         .set_encoding(Encoding::PLAIN)
         .build();
     Ok(SerializedFileWriter::new(
