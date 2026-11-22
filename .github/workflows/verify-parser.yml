@@ -1,0 +1,26 @@
+name: Validate parser optimization
+on:
+  push:
+    branches:
+      - perf/streaming-utf8-check
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust unit tests
+        run: cargo test --locked --release --manifest-path pipeline/native/Cargo.toml
+      - name: Install Python comparison tools
+        run: python3 -m pip install --break-system-packages polars
+      - name: Build submission and run 36 official fixtures
+        env:
+          CPUS: '4'
+          NCPU: '4'
+        run: |
+          docker build --platform linux/amd64 -t shopping-sessions:latest .
+          python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh

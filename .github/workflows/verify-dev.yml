@@ -1,0 +1,40 @@
+name: Verify 1M reference on parser branch
+on:
+  push:
+    branches:
+      - perf/streaming-utf8-check
+  workflow_dispatch:
+
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install reference comparer
+        run: python3 -m pip install --break-system-packages polars
+      - name: Download official generator and answers
+        run: |
+          mkdir -p /tmp/shop-gen /tmp/shop-answers
+          curl --retry 3 --fail --location --silent --show-error https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o /tmp/gen.zip
+          curl --retry 3 --fail --location --silent --show-error https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/dev-answer.zip -o /tmp/ans.zip
+          unzip -q /tmp/gen.zip -d /tmp/shop-gen
+          unzip -q /tmp/ans.zip -d /tmp/shop-answers
+      - name: Generate 1M official dev inputs
+        run: |
+          GEN=$(find /tmp/shop-gen -name Cargo.toml -print -quit)
+          test -n "$GEN"
+          cargo run --release --manifest-path "$GEN" -- --seed 1 --events 1000000 --clicks 250000 --output /tmp/shop-dev
+      - name: Build image and compare exact answers
+        env:
+          CPUS: '4'
+          NCPU: '4'
+        run: |
+          docker build --platform linux/amd64 -t shopping-sessions:latest .
+          mkdir -p /tmp/shop-out
+          time scripts/docker_run.sh /tmp/shop-dev /tmp/shop-out
+          ANSWER=$(find /tmp/shop-answers -name user_daily.csv -print -quit)
+          test -n "$ANSWER"
+          python3 scripts/compare.py /tmp/shop-out "$(dirname "$ANSWER")"
