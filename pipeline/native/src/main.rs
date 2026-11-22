@@ -140,6 +140,8 @@ struct Links<K> {
     index: Map<K, usize>,
     names: Vec<K>,
     roots: Vec<usize>,
+    sizes: Vec<usize>,
+    minima: Vec<K>,
 }
 
 impl<K: Copy + Eq + std::hash::Hash> Links<K> {
@@ -148,6 +150,8 @@ impl<K: Copy + Eq + std::hash::Hash> Links<K> {
             let index = self.names.len();
             self.names.push(name);
             self.roots.push(index);
+            self.sizes.push(1);
+            self.minima.push(name);
             index
         })
     }
@@ -168,6 +172,8 @@ impl<K: Copy + Eq + std::hash::Hash> Links<K> {
             index: Map::default(),
             names: Vec::new(),
             roots: Vec::new(),
+            sizes: Vec::new(),
+            minima: Vec::new(),
         };
         for file in files {
             let Some(header) = memchr(b'\n', file) else {
@@ -181,10 +187,19 @@ impl<K: Copy + Eq + std::hash::Hash> Links<K> {
                 let right = links.add(K::encode(right)?);
                 let left = links.root(left);
                 let right = links.root(right);
-                if links.names[left] < links.names[right] {
-                    links.roots[right] = left;
-                } else {
-                    links.roots[left] = right;
+                if left != right {
+                    // Maintain shallow trees with union by size, while keeping
+                    // the lexicographically smallest ID as the component label.
+                    let (parent, child) = if links.sizes[left] >= links.sizes[right] {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    links.roots[child] = parent;
+                    links.sizes[parent] += links.sizes[child];
+                    if links.minima[child] < links.minima[parent] {
+                        links.minima[parent] = links.minima[child];
+                    }
                 }
                 Ok(())
             })?;
@@ -195,7 +210,7 @@ impl<K: Copy + Eq + std::hash::Hash> Links<K> {
         Ok(links
             .index
             .into_iter()
-            .map(|(name, i)| (name, links.names[links.roots[i]]))
+            .map(|(name, i)| (name, links.minima[links.roots[i]]))
             .collect())
     }
 }
