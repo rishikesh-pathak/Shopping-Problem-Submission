@@ -425,12 +425,12 @@ struct WorkerTimings {
 // LSD radix grouping by lexicographic first four UTF-8 bytes. A final
 // comparison sort within each prefix group makes the complete result exactly
 // equivalent to sorting on the full key. This is valid for arbitrary Unicode.
-fn radix_prefix<T: Copy>(items: &mut Vec<T>, prefix: impl Fn(&T) -> u32 + Copy) {
+fn radix_prefix<T: Copy>(items: &mut Vec<T>, prefix: impl Fn(&T) -> u64 + Copy) {
     if items.len() < 1024 {
         return;
     }
     let mut scratch = items.clone();
-    for shift in [0, 8, 16, 24] {
+    for shift in [0, 8, 16, 24, 32] {
         let mut counts = [0usize; 256];
         for item in items.iter() {
             counts[((prefix(item) >> shift) & 255) as usize] += 1;
