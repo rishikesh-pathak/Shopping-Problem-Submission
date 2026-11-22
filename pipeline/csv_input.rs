@@ -143,3 +143,29 @@ pub fn input_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     files.sort();
     Ok(files)
 }
+
+#[cfg(test)]
+mod decimal_fast_path_tests {
+    use super::*;
+    #[test]
+    fn fixed_decimal_parsers_match_reference() {
+        for value in 0..=99 {
+            let text = format!("{value:02}");
+            assert_eq!(dec2(text.as_bytes()), digits(text.as_bytes()));
+        }
+        for value in 0..=9999 {
+            let text = format!("{value:04}");
+            assert_eq!(dec4(text.as_bytes()), digits(text.as_bytes()));
+        }
+        for a in 0_u8..=255 {
+            for b in 0_u8..=255 {
+                assert_eq!(dec2(&[a,b]), digits(&[a,b]));
+            }
+        }
+        for text in ["", "a", "abc", "999999999999999999", "9223372036854775807",
+            "9223372036854775808", "18446744073709551615", "-1"] {
+            let expected = text.parse::<i64>().ok().filter(|_| !text.starts_with('-'));
+            assert_eq!(digits(text.as_bytes()), expected, "value: {text}");
+        }
+    }
+}
