@@ -713,7 +713,7 @@ impl Dataset {
             hash: RandomState::new(),
         };
         lap("build identity map");
-        let events = event_chunks
+        let events: Vec<Vec<Vec<EventCandidate<K>>>> = event_chunks
             .par_iter()
             .map(|chunk| input.events(chunk))
             .collect::<Result<_>>()?;
@@ -747,7 +747,7 @@ impl Dataset {
                 event_timings.identity_lookups.as_secs_f64()
             );
         }
-        let clicks = click_chunks
+        let clicks: Vec<Vec<Vec<Click<K>>>> = click_chunks
             .par_iter()
             .map(|chunk| input.clicks(chunk))
             .collect::<Result<_>>()?;
