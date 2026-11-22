@@ -201,8 +201,10 @@ struct Event<K> {
     category: u32,
 }
 
+#[derive(Clone, Copy)]
 struct EventCandidate<K> {
     id: K,
+    hash: u64,
     ingest: i64,
     event: Event<K>,
 }
@@ -288,7 +290,8 @@ impl<'a, K: Identifier<'a>> Input<'a, K> {
             }
             // Invalid payloads are still candidates for earliest ingest.
             let id = K::encode(id)?;
-            lanes[self.bucket(id)].push(EventCandidate { id, ingest, event });
+            let hash = self.hash.hash_one(id);
+            lanes[hash as usize & (PARTITIONS - 1)].push(EventCandidate { id, hash, ingest, event });
             Ok(())
         })?;
         Ok(lanes)
@@ -300,24 +303,35 @@ impl<'a, K: Identifier<'a>> Input<'a, K> {
         mut timings: Option<&mut EventTimings>,
     ) -> Result<Vec<Vec<Event<K>>>> {
         let dedup_started = timings.as_ref().map(|_| Instant::now());
-        let count = chunks.iter().map(Vec::len).sum();
-        // Each lane shares the partition hash's low bits. Use a separate seed
-        // so those bits don't also determine placement inside the dedup table.
-        let mut earliest = Map::with_capacity_and_hasher(count, RandomState::new());
-        for EventCandidate { id, ingest, event } in chunks.into_iter().flatten() {
-            match earliest.entry(id) {
-                Entry::Vacant(slot) => {
-                    slot.insert((ingest, event));
+        // A radix sort over already-computed hashes replaces random-access
+        // allocation-heavy hash map insertion. This is an exact implementation:
+        // collisions are resolved by the complete identifier, and earliest
+        // ingest plus invalid payload and tied-ingest rules are preserved.
+        let mut rows = flatten(chunks);
+        if rows.len() > 1 {
+            let mut spare = rows.clone();
+            for shift in [0, 8, 16, 24, 32, 40, 48, 56] {
+                // Low 7 bits are constant within each input lane; avoid
+                // copying rows on that pass.
+                let mut counts = [0usize; 256];
+                for row in &rows {
+                    counts[((row.hash >> shift) & 255) as usize] += 1;
                 }
-                Entry::Occupied(mut slot) => {
-                    let (previous, previous_event) = slot.get();
-                    if ingest == *previous && event != *previous_event {
-                        return Err(UseSql("event ID and ingest timestamp tie").into());
-                    }
-                    if ingest < *previous {
-                        slot.insert((ingest, event));
-                    }
+                if counts.iter().any(|&count| count == rows.len()) {
+                    continue;
                 }
+                let mut offset = 0usize;
+                for count in &mut counts {
+                    let len = *count;
+                    *count = offset;
+                    offset += len;
+                }
+                for row in &rows {
+                    let bucket = ((row.hash >> shift) & 255) as usize;
+                    spare[counts[bucket]] = *row;
+                    counts[bucket] += 1;
+                }
+                std::mem::swap(&mut rows, &mut spare);
             }
         }
         if let (Some(timing), Some(started)) = (&mut timings, dedup_started) {
@@ -325,10 +339,27 @@ impl<'a, K: Identifier<'a>> Input<'a, K> {
         }
         let routing_started = timings.as_ref().map(|_| Instant::now());
         let mut lanes = buckets();
-        for (_, event) in earliest.into_values() {
-            if event.user != K::EMPTY {
-                let user = self.person(event.user);
-                lanes[self.bucket(user)].push(Event { user, ..event });
+        for collision_set in rows.chunk_by_mut(|a, b| a.hash == b.hash) {
+            if collision_set.len() > 1 {
+                collision_set.sort_unstable_by(|a,b| a.id.cmp(&b.id).then_with(|| a.ingest.cmp(&b.ingest)));
+            }
+            for same_id in collision_set.chunk_by(|a,b| a.id == b.id) {
+                let chosen = &same_id[0];
+                for dup in same_id.iter().skip(1) {
+                    if dup.ingest != chosen.ingest {
+                        break;
+                    }
+                    if dup.event != chosen.event {
+                        return Err(UseSql("event ID and ingest timestamp tie").into());
+                    }
+                }
+                if chosen.event.user != K::EMPTY {
+                    let user = self.person(chosen.event.user);
+                    lanes[self.bucket(user)].push(Event {
+                        user,
+                        ..chosen.event
+                    });
+                }
             }
         }
         if let (Some(timing), Some(started)) = (timings, routing_started) {
