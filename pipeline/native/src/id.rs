@@ -152,7 +152,7 @@ mod tests {
 /// fallback for arbitrary UTF-8. Borrowed bytes live in input mmaps owned by
 /// Dataset for the full duration of process(). The MSB in len_tag marks wide
 /// identifiers; no ordinary input can allocate 2^63 bytes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct HybridId<'a> {
     value: u64,
     len_tag: u64,
