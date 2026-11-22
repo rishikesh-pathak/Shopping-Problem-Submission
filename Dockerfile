@@ -7,12 +7,14 @@ COPY pipeline/stage.rs pipeline/csv_input.rs /src/
 RUN rustc --edition=2021 -C opt-level=3 /src/stage.rs -o /src/stage
 COPY pipeline/native /src/native
 RUN --mount=type=secret,id=pip_ca --mount=type=bind,from=cargo-registry,target=/cargo-registry \
+    --mount=type=tmpfs,target=/src/native/target \
     if [ -f /run/secrets/pip_ca ]; then export CARGO_HTTP_SSL_CAINFO=/run/secrets/pip_ca; fi; \
     if [ -d /cargo-registry/vendor ]; then \
         set -- --offline --config 'source.crates-io.replace-with="vendor"' \
             --config 'source.vendor.directory="/cargo-registry/vendor"'; \
     else set --; fi; \
-    cargo build --manifest-path /src/native/Cargo.toml --release --locked "$@"
+    RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes" cargo build --manifest-path /src/native/Cargo.toml --release --locked "$@" \
+    && cp /src/native/target/release/shopping-native /src/shopping-native
 
 FROM python:3.12-slim-bookworm
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
@@ -21,7 +23,7 @@ RUN --mount=type=secret,id=pip_ca \
     if [ -f /run/secrets/pip_ca ]; then export PIP_CERT=/run/secrets/pip_ca; fi; \
     pip install --no-cache-dir -r /app/requirements.txt
 COPY --from=rust-builder --chmod=0755 /src/stage /app/pipeline/stage
-COPY --from=rust-builder --chmod=0755 /src/native/target/release/shopping-native /app/pipeline/shopping-native
+COPY --from=rust-builder --chmod=0755 /src/shopping-native /app/pipeline/shopping-native
 COPY --chmod=0644 pipeline/pipeline.py /app/pipeline/pipeline.py
 COPY --chmod=0755 run.sh /app/run.sh
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1

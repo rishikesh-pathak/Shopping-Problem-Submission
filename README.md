@@ -1,6 +1,6 @@
 # Databricks Shopping Sessions
 
-The native Rust engine parses input in parallel, links identities, deduplicates events and clicks, groups events into sessions, computes attribution and assists, and writes Parquet. It sorts events and clicks by compact canonical-person indexes and coalesces identical click copies during that sort. The image also contains the original DuckDB engine for inputs that require the general CSV reader, contain conflicting copies of an event at the same ingest timestamp, or exceed the native memory estimate.
+The native Rust engine parses input in parallel, links identities, deduplicates events and clicks, groups events into sessions, computes attribution and assists, and writes Parquet. It sorts by losslessly packed identifiers for up to nine nonzero ASCII bytes, with a full-width native string path for other identifiers. An AVX2 scanner handles ASCII CSV on supported CPUs. It uses the scalar parser for other input and processors. The image also contains the original DuckDB engine for inputs that require the general CSV reader, contain conflicting copies of an event at the same ingest timestamp, or exceed the native memory estimate.
 
 ### Uploaded baseline results from the Windows laptop (2026-11-21)
 
@@ -47,6 +47,8 @@ make check-dev ANSWER=/path/to/unpacked/dev-answer
 The test container runs as UID 1000 with networking disabled and a read-only root filesystem. The default limits are eight CPUs and 24 GB. Set `CPUS=4` if the host has a four-core quota. The image build downloads the locked Cargo dependencies and the pinned DuckDB wheel. If your build uses a TLS proxy, pass its trusted bundle with `PIP_CA=/path/to/ca-bundle.crt`. If the Docker builder is offline from crates.io, vendor dependencies on a connected machine with `cargo vendor --locked --manifest-path pipeline/native/Cargo.toml /path/to/cache/vendor`, then build with `CARGO_VENDOR=/path/to/cache`.
 
 The development check uses the competition generator and its seed-1 answer pair. Additional generator-scale checks can use seed 17 with 20M events and 5M clicks, and seed 31 with 60M events and 15M clicks. Generate those inputs outside the checkout, then time the image and inspect the engine phases with `SHOPPING_PROFILE=1 scripts/docker_run.sh INPUT_DIR OUTPUT_DIR`. Keep the engine's internal time and the Docker wrapper's wall time separate. The maximum worker timings describe overlapping work and should be read individually.
+
+Use `SHOPPING_PROFILE=1 SHOPPING_PROFILE_DETAIL=1` for diagnostic timings of deduplication, identity lookups, sessionization, and campaign attribution. Partition totals accumulate work across concurrent partitions. For the regular speed check, leave detailed timings off. Set `NCPU` to vary the worker count independently from the Docker CPU quota `CPUS`.
 
 ### Submit a verified revision
 

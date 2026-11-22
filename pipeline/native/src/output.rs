@@ -1,4 +1,4 @@
-use crate::{CampaignDay, Result, UserDay};
+use crate::{id::Identifier, CampaignDay, Result, UserDay};
 use parquet::basic::{Compression, Encoding};
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
@@ -55,7 +55,7 @@ pub fn remove_unused_user_parts(dir: &Path, files_written: usize) -> Result<()> 
 fn writer(path: &Path, schema: &str) -> Result<SerializedFileWriter<File>> {
     let schema = Arc::new(parse_message_type(schema)?);
     let properties = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(Compression::UNCOMPRESSED)
         .set_encoding(Encoding::PLAIN)
         .build();
     Ok(SerializedFileWriter::new(
@@ -65,7 +65,11 @@ fn writer(path: &Path, schema: &str) -> Result<SerializedFileWriter<File>> {
     )?)
 }
 
-pub fn users(path: &Path, categories: &[&str], days: &[UserDay<'_>]) -> Result<()> {
+pub fn users<'a, K: Identifier<'a>>(
+    path: &Path,
+    categories: &[&str],
+    days: &[UserDay<K>],
+) -> Result<()> {
     let mut writer = writer(path, USERS)?;
     for batch in days.chunks(ROW_GROUP_SIZE) {
         let mut group = writer.next_row_group()?;
@@ -73,8 +77,7 @@ pub fn users(path: &Path, categories: &[&str], days: &[UserDay<'_>]) -> Result<(
         while let Some(mut column) = group.next_column()? {
             match column.untyped() {
                 ColumnWriter::ByteArrayColumnWriter(w) if index == 0 => {
-                    let values: Vec<_> =
-                        batch.iter().map(|row| ByteArray::from(row.user)).collect();
+                    let values: Vec<_> = batch.iter().map(|row| row.user.parquet()).collect();
                     w.write_batch(&values, None, None)?;
                 }
                 ColumnWriter::ByteArrayColumnWriter(w) => {
