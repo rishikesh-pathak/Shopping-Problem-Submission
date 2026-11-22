@@ -1,0 +1,24 @@
+name: Inspect public generator ID formats
+on:
+  push:
+    branches:
+      - research/id-shapes
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate small public sample
+        run: |
+          mkdir -p /tmp/generator
+          curl -fsSL https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o /tmp/generator.zip
+          unzip -q /tmp/generator.zip -d /tmp/generator
+          GEN=$(find /tmp/generator -name Cargo.toml -print -quit)
+          cargo run --release --manifest-path "$GEN" -- --seed 7 --events 5000 --clicks 1200 --output /tmp/public-sample
+          for kind in events clicks links; do
+            echo "=== PUBLIC GENERATOR SAMPLES $kind ==="
+            FILE=$(find "/tmp/public-sample/$kind" -name '*.csv' -print -quit)
+            head -n 6 "$FILE"
+          done
