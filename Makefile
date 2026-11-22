@@ -4,6 +4,7 @@ MEM   ?= 24g
 # The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.
 PLATFORM ?= linux/amd64
 PIP_CA ?=
+CARGO_VENDOR ?=
 PYTHON ?= python3
 comma := ,
 DEV   ?= dev
@@ -15,7 +16,7 @@ export IMAGE CPUS MEM PLATFORM
 
 ## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:
-	docker buildx build --platform $(PLATFORM) $(if $(PIP_CA),--secret "id=pip_ca$(comma)src=$(PIP_CA)") --load -t $(IMAGE) .
+	docker buildx build --platform $(PLATFORM) $(if $(PIP_CA),--secret "id=pip_ca$(comma)src=$(PIP_CA)") $(if $(CARGO_VENDOR),--build-context "cargo-registry=$(CARGO_VENDOR)") --load -t $(IMAGE) .
 
 ## Run the image on all 36 edge-case fixtures and diff against the expected tables
 fixtures: build

@@ -30,5 +30,5 @@ docker run --rm --platform "$PLATFORM" \
   -v "$DATA":/data:ro,z -v "$OUT":/output:z -v "$SCRATCH":/scratch:z \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
   -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" \
-  -e SHOPPING_PROFILE \
+  -e SHOPPING_PROFILE -e SHOPPING_FORCE_SQL \
   "$IMAGE"

@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.exe
 pipeline/stage
+pipeline/native/target/
 .data/
 dev/
 dev_test_downloads/

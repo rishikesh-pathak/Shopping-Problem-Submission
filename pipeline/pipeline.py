@@ -364,6 +364,10 @@ def main():
          LEFT JOIN campaigns m ON m.campaign_id=coalesce(x.campaign,a.campaign)
        ) TO '{(OUT/'campaign_daily'/'part-0.parquet').as_posix()}' (FORMAT PARQUET)
     ''')
+    # A previous native run can have written additional user shards.
+    for part in (OUT/'user_daily').glob('part-*.parquet'):
+        if re.fullmatch(r'part-[1-9][0-9]*\.parquet', part.name) and part.is_file():
+            part.unlink()
     print(f'Finished in {time.monotonic()-t0:.2f}s', file=sys.stderr)
 
 
