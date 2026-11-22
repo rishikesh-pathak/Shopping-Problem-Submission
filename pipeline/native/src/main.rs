@@ -213,6 +213,7 @@ struct EventTimings {
     identity_lookups: Duration,
 }
 
+#[derive(Clone, Copy)]
 struct Click<K> {
     id: K,
     user: K,
@@ -421,13 +422,63 @@ struct WorkerTimings {
     user_parquet: Duration,
 }
 
-fn sort_clicks<K: Ord>(clicks: &mut Vec<Click<K>>) {
-    clicks.sort_unstable_by(|a, b| {
+// LSD radix grouping by lexicographic first four UTF-8 bytes. A final
+// comparison sort within each prefix group makes the complete result exactly
+// equivalent to sorting on the full key. This is valid for arbitrary Unicode.
+fn radix_prefix<T: Copy>(items: &mut Vec<T>, prefix: impl Fn(&T) -> u32 + Copy) {
+    if items.len() < 1024 {
+        return;
+    }
+    let mut scratch = items.clone();
+    for shift in [0, 8, 16, 24] {
+        let mut counts = [0usize; 256];
+        for item in items.iter() {
+            counts[((prefix(item) >> shift) & 255) as usize] += 1;
+        }
+        if counts.iter().any(|&count| count == items.len()) {
+            continue;
+        }
+        let mut start = 0;
+        for count in &mut counts {
+            let size = *count;
+            *count = start;
+            start += size;
+        }
+        for item in items.iter() {
+            let bucket = ((prefix(item) >> shift) & 255) as usize;
+            scratch[counts[bucket]] = *item;
+            counts[bucket] += 1;
+        }
+        std::mem::swap(items, &mut scratch);
+    }
+}
+
+fn sort_event_rows<'a, K: Identifier<'a>>(events: &mut Vec<Event<K>>) {
+    if events.len() < 1024 || events[0].user.lex_prefix().is_none() {
+        events.sort_unstable_by_key(|event| (event.user, event.ms));
+        return;
+    }
+    radix_prefix(events, |e| e.user.lex_prefix().unwrap());
+    for group in events.chunk_by_mut(|a, b| a.user.lex_prefix() == b.user.lex_prefix()) {
+        group.sort_unstable_by_key(|event| (event.user, event.ms));
+    }
+}
+
+fn sort_clicks<'a, K: Identifier<'a>>(clicks: &mut Vec<Click<K>>) {
+    let cmp = |a: &Click<K>, b: &Click<K>| {
         a.user
             .cmp(&b.user)
             .then_with(|| a.ms.cmp(&b.ms))
             .then_with(|| b.id.cmp(&a.id))
-    });
+    };
+    if clicks.len() >= 1024 && clicks[0].user.lex_prefix().is_some() {
+        radix_prefix(clicks, |c| c.user.lex_prefix().unwrap());
+        for group in clicks.chunk_by_mut(|a, b| a.user.lex_prefix() == b.user.lex_prefix()) {
+            group.sort_unstable_by(&cmp);
+        }
+    } else {
+        clicks.sort_unstable_by(&cmp);
+    }
     // The ordering needed for attribution also makes identical copies adjacent.
     clicks.dedup_by(|a, b| a.id == b.id);
 }
@@ -478,7 +529,7 @@ fn add_user_day<K>(
     }
 }
 
-fn aggregate<K: Copy + Ord>(
+fn aggregate<'a, K: Identifier<'a>>(
     mut events: Vec<Event<K>>,
     mut clicks: Vec<Click<K>>,
     organic: u32,
@@ -488,7 +539,7 @@ fn aggregate<K: Copy + Ord>(
     mut timings: Option<&mut WorkerTimings>,
 ) {
     let sorting_started = timings.as_ref().map(|_| Instant::now());
-    events.sort_unstable_by_key(|event| (event.user, event.ms));
+    sort_event_rows(&mut events);
     sort_clicks(&mut clicks);
 
     if let (Some(timing), Some(started)) = (&mut timings, sorting_started) {
