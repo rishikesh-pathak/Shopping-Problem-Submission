@@ -48,6 +48,8 @@ The test container runs as UID 1000 with networking disabled and a read-only roo
 
 The development check uses the competition generator and its seed-1 answer pair. Additional generator-scale checks can use seed 17 with 20M events and 5M clicks, and seed 31 with 60M events and 15M clicks. Generate those inputs outside the checkout, then time the image and inspect the engine phases with `SHOPPING_PROFILE=1 scripts/docker_run.sh INPUT_DIR OUTPUT_DIR`. Keep the engine's internal time and the Docker wrapper's wall time separate. The maximum worker timings describe overlapping work and should be read individually.
 
+The runner defaults the Rust worker count to the Docker CPU limit. Set `NCPU` to vary the worker count independently. For example, `CPUS=4 NCPU=8 MEM=24g` runs eight software workers under a four-CPU quota.
+
 ### Submit a verified revision
 
 Use the public GitHub repository URL and the full SHA of the commit that passed validation. The Dockerfile lives at the repository root. See [GITHUB_STEPS.txt](GITHUB_STEPS.txt) for the branch, pull request, and submission workflow.

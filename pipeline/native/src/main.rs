@@ -13,11 +13,13 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{env, fmt, io};
 
 const PARTITIONS: usize = 128;
 const CHUNK_BYTES: usize = 2 * 1024 * 1024;
+const CHUNKS_PER_BATCH: usize = 8;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const SESSION_GAP: i64 = 1_800_000;
@@ -44,6 +46,31 @@ impl fmt::Display for UseSql {
     }
 }
 impl Error for UseSql {}
+
+struct MemoryBudget {
+    remaining: AtomicU64,
+}
+
+impl MemoryBudget {
+    fn new(limit: u128, fixed: u128) -> Result<Self> {
+        let remaining = limit
+            .checked_sub(fixed)
+            .ok_or(UseSql("input exceeds native memory budget"))?;
+        Ok(Self {
+            remaining: AtomicU64::new(remaining.min(u128::from(u64::MAX)) as u64),
+        })
+    }
+
+    fn charge_rows(&self, count: usize, bytes_per_row: u64) -> Result<()> {
+        let charge = (count as u64).saturating_mul(bytes_per_row);
+        self.remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |available| {
+                available.checked_sub(charge)
+            })
+            .map(|_| ())
+            .map_err(|_| UseSql("input exceeds native memory budget").into())
+    }
+}
 
 fn env_path(var: &str, default: &str) -> PathBuf {
     env::var_os(var).map_or_else(|| default.into(), PathBuf::from)
@@ -261,8 +288,8 @@ impl Input<'_> {
         self.identity.get(user).copied().unwrap_or(user)
     }
 
-    fn events<'a>(&'a self, chunk: &'a [u8]) -> Result<Vec<Vec<EventCandidate<'a>>>> {
-        let mut lanes = buckets();
+    fn events<'a>(&self, chunk: &'a [u8], lanes: &mut [Vec<EventCandidate<'a>>]) -> Result<usize> {
+        let mut count = 0;
         for_rows(chunk, |[id, user, time, ingest, kind, product, price]| {
             if id.is_empty() {
                 return Ok(());
@@ -303,9 +330,10 @@ impl Input<'_> {
             }
             // Invalid payloads are still candidates for earliest ingest.
             lanes[self.bucket(id)].push(EventCandidate { id, ingest, event });
+            count += 1;
             Ok(())
         })?;
-        Ok(lanes)
+        Ok(count)
     }
 
     fn dedup_events<'a>(
@@ -316,25 +344,33 @@ impl Input<'_> {
         // Each lane shares the partition hash's low bits. Use a separate seed
         // so those bits don't also determine placement inside the dedup table.
         let mut earliest = Map::with_capacity_and_hasher(count, RandomState::new());
-        for EventCandidate { id, ingest, event } in chunks.into_iter().flatten() {
-            match earliest.entry(id) {
+        let mut selected = vec![true; count];
+        for (index, candidate) in chunks.iter().flatten().enumerate() {
+            match earliest.entry(candidate.id) {
                 Entry::Vacant(slot) => {
-                    slot.insert((ingest, event));
+                    slot.insert((index, candidate));
                 }
                 Entry::Occupied(mut slot) => {
-                    let (previous, previous_event) = slot.get();
-                    if ingest == *previous && event != *previous_event {
+                    let (previous_index, previous) = *slot.get();
+                    if candidate.ingest == previous.ingest && candidate.event != previous.event {
                         return Err(UseSql("event ID and ingest timestamp tie").into());
                     }
-                    if ingest < *previous {
-                        slot.insert((ingest, event));
+                    if candidate.ingest < previous.ingest {
+                        selected[previous_index] = false;
+                        slot.insert((index, candidate));
+                    } else {
+                        selected[index] = false;
                     }
                 }
             }
         }
+        drop(earliest);
+        // Keep payloads out of the hash table and consume the winning rows in
+        // input order, so identity resolution reads across contiguous fragments.
         let mut lanes = buckets();
-        for (_, event) in earliest.into_values() {
-            if !event.user.is_empty() {
+        for (candidate, keep) in chunks.into_iter().flatten().zip(selected) {
+            let event = candidate.event;
+            if keep && !event.user.is_empty() {
                 let user = self.person(event.user);
                 lanes[self.bucket(user)].push(Event { user, ..event });
             }
@@ -342,8 +378,8 @@ impl Input<'_> {
         Ok(lanes)
     }
 
-    fn clicks<'a>(&'a self, chunk: &'a [u8]) -> Result<Vec<Vec<Click<'a>>>> {
-        let mut lanes = buckets();
+    fn clicks<'a>(&'a self, chunk: &'a [u8], lanes: &mut [Vec<Click<'a>>]) -> Result<usize> {
+        let mut count = 0;
         for_rows(chunk, |[id, user, campaign, time]| {
             if id.is_empty() {
                 return Ok(());
@@ -362,15 +398,37 @@ impl Input<'_> {
                     ms,
                     campaign,
                 });
+                count += 1;
             }
             Ok(())
         })?;
-        Ok(lanes)
+        Ok(count)
     }
 }
 
 fn buckets<T>() -> Vec<Vec<T>> {
     (0..PARTITIONS).map(|_| Vec::new()).collect()
+}
+
+fn parse_partitions<'a, T: Send>(
+    chunks: &[&'a [u8]],
+    budget: &MemoryBudget,
+    bytes_per_row: u64,
+    parse: impl Fn(&'a [u8], &mut [Vec<T>]) -> Result<usize> + Sync,
+) -> Result<Vec<Vec<Vec<T>>>> {
+    chunks
+        .par_chunks(CHUNKS_PER_BATCH)
+        .map(|batch| {
+            let mut lanes = buckets();
+            for chunk in batch {
+                // Account after each bounded chunk rather than scanning all
+                // fact files once to count rows and again to parse them.
+                let count = parse(chunk, &mut lanes)?;
+                budget.charge_rows(count, bytes_per_row)?;
+            }
+            Ok(lanes)
+        })
+        .collect()
 }
 
 fn transpose<T>(chunks: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
@@ -479,10 +537,17 @@ mod tests {
             unknown: 0,
             hash: RandomState::new(),
         };
-        let a = input
-            .clicks(b"k1,u,c1,1000\nk2,u,c2,1000\nk3,click-only,c1,1000\n")
+        let mut a = buckets();
+        let mut b = buckets();
+        input
+            .clicks(
+                b"k1,u,c1,1000\nk2,u,c2,1000\nk3,click-only,c1,1000\n",
+                &mut a,
+            )
             .unwrap();
-        let b = input.clicks(b"\"k1\",\"u\",\"c1\",\"1000\"\n").unwrap();
+        input
+            .clicks(b"\"k1\",\"u\",\"c1\",\"1000\"\n", &mut b)
+            .unwrap();
         let events = vec![vec![Event {
             user: "u",
             ms: 1000,
@@ -691,23 +756,12 @@ fn run() -> Result<()> {
     }
     let event_chunks = chunks(&events);
     let click_chunks = chunks(&clicks);
-    let ((event_rows, click_rows), link_rows) = rayon::join(
-        || rayon::join(|| row_bound(&event_chunks), || row_bound(&click_chunks)),
-        || row_bound(&chunks(&links)),
-    );
-    // Allow for mapped input, per-record partition buffers, hash tables, and
-    // Parquet writers. Leave headroom for allocator and runtime overhead.
-    let estimated = bytes
-        + event_rows as u128 * 175
-        + click_rows as u128 * 130
-        + link_rows as u128 * 192
-        + (1 << 30);
-    if estimated > memory_budget {
-        return Err(UseSql("input exceeds native memory budget").into());
-    }
-    let identity = Links::read(&links)?;
-    let input = Input {
-        identity,
+    let link_rows = row_bound(&chunks(&links));
+    // Preserve headroom for allocator overhead and chunks still being parsed.
+    // Fact rows are charged as they enter the partition buffers.
+    let budget = MemoryBudget::new(memory_budget, bytes + link_rows as u128 * 192 + (1 << 30))?;
+    let mut input = Input {
+        identity: Map::default(),
         products: products
             .into_iter()
             .map(|(id, category)| (id, category_ids[category]))
@@ -718,22 +772,40 @@ fn run() -> Result<()> {
         unknown: category_ids["unknown"],
         hash: RandomState::new(),
     };
-    lap("map input and identity links");
-    let events = event_chunks
-        .par_iter()
-        .map(|chunk| input.events(chunk))
-        .collect::<Result<_>>()?;
-    lap("parse and partition events");
+    lap("map inputs and plan partitions");
+    // Event parsing only reads the product lookup. Resolve identity links
+    // concurrently and join before routing deduplicated events by person.
+    let (identity, events) = rayon::join(
+        || {
+            let began = profiling.then(Instant::now);
+            let identity = Links::read(&links);
+            if let Some(began) = began {
+                eprintln!(
+                    "[PROFILE] Build identity map (overlaps parsing): {:.3}s",
+                    began.elapsed().as_secs_f64()
+                );
+            }
+            identity
+        },
+        || {
+            parse_partitions(&event_chunks, &budget, 175, |chunk, lanes| {
+                input.events(chunk, lanes)
+            })
+        },
+    );
+    input.identity = identity?;
+    let events = events?;
+    let event_rows: usize = events.iter().flatten().map(Vec::len).sum();
+    lap("parse and partition events with identity linking");
     let events = transpose(events)
         .into_par_iter()
         .map(|lane| input.dedup_events(lane))
         .collect::<Result<_>>()?;
     let events = transpose(events);
     lap("deduplicate and link events");
-    let clicks = click_chunks
-        .par_iter()
-        .map(|chunk| input.clicks(chunk))
-        .collect::<Result<_>>()?;
+    let clicks = parse_partitions(&click_chunks, &budget, 130, |chunk, lanes| {
+        input.clicks(chunk, lanes)
+    })?;
     let clicks = transpose(clicks);
 
     lap("parse and link clicks");

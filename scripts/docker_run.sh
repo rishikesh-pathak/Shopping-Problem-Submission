@@ -4,6 +4,7 @@
 set -eu
 IMAGE="${IMAGE:-shopping-sessions:latest}"
 CPUS="${CPUS:-8}"
+NCPU="${NCPU:-${CPUS%.*}}"
 MEM="${MEM:-24g}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 DATA=$(cd "$1" && pwd)
@@ -29,6 +30,6 @@ docker run --rm --platform "$PLATFORM" \
   --user 1000:1000 \
   -v "$DATA":/data:ro,z -v "$OUT":/output:z -v "$SCRATCH":/scratch:z \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-  -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" \
+  -e NCPU="$NCPU" -e MEM_GB="${MEM%g}" \
   -e SHOPPING_PROFILE -e SHOPPING_FORCE_SQL \
   "$IMAGE"
