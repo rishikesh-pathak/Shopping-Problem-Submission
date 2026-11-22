@@ -13,7 +13,7 @@ RUN --mount=type=secret,id=pip_ca --mount=type=bind,from=cargo-registry,target=/
         set -- --offline --config 'source.crates-io.replace-with="vendor"' \
             --config 'source.vendor.directory="/cargo-registry/vendor"'; \
     else set --; fi; \
-    RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes" cargo build --manifest-path /src/native/Cargo.toml --release --locked "$@" \
+    cargo build --manifest-path /src/native/Cargo.toml --release --locked "$@" \
     && cp /src/native/target/release/shopping-native /src/shopping-native
 
 FROM python:3.12-slim-bookworm
