@@ -8,13 +8,38 @@ pub fn digits(bytes: &[u8]) -> Option<i64> {
         return None;
     }
     let mut x: i64 = 0;
-    for b in bytes {
-        if !b.is_ascii_digit() {
+    if bytes.len() <= 18 {
+        // An eighteen-digit decimal value cannot overflow a signed i64.
+        // Avoid checked arithmetic on the hot 13-digit epoch timestamps.
+        for &byte in bytes {
+            let d = byte.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            x = x * 10 + i64::from(d);
+        }
+        return Some(x);
+    }
+    for &byte in bytes {
+        let d = byte.wrapping_sub(b'0');
+        if d > 9 {
             return None;
         }
-        x = x.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+        x = x.checked_mul(10)?.checked_add(i64::from(d))?;
     }
     Some(x)
+}
+fn dec2(s: &[u8]) -> Option<i64> {
+    if s.len() != 2 { return None; }
+    let a = s[0].wrapping_sub(b'0');
+    let b = s[1].wrapping_sub(b'0');
+    if a | b > 9 { return None; }
+    Some(i64::from(a) * 10 + i64::from(b))
+}
+fn dec4(s: &[u8]) -> Option<i64> {
+    let a = dec2(&s[..2])?;
+    let b = dec2(&s[2..4])?;
+    Some(a * 100 + b)
 }
 fn date_parts(s: &[u8]) -> Option<(i64, i64, i64, i64, i64, i64)> {
     if s.len() < 19
@@ -26,12 +51,12 @@ fn date_parts(s: &[u8]) -> Option<(i64, i64, i64, i64, i64, i64)> {
     {
         return None;
     }
-    let y = digits(&s[0..4])?;
-    let m = digits(&s[5..7])?;
-    let d = digits(&s[8..10])?;
-    let hh = digits(&s[11..13])?;
-    let mm = digits(&s[14..16])?;
-    let ss = digits(&s[17..19])?;
+    let y = dec4(&s[0..4])?;
+    let m = dec2(&s[5..7])?;
+    let d = dec2(&s[8..10])?;
+    let hh = dec2(&s[11..13])?;
+    let mm = dec2(&s[14..16])?;
+    let ss = dec2(&s[17..19])?;
     if !(1..=9999).contains(&y) || !(1..=12).contains(&m) || hh > 23 || mm > 59 || ss > 59 {
         return None;
     }
@@ -67,8 +92,8 @@ pub fn stamp(s: &str) -> Option<i64> {
     let days = era * 146097 + doe - 719468;
     let mut ms = (((days * 24 + hh) * 60 + mm) * 60 + ss) * 1000;
     if b.len() == 25 {
-        let offh = digits(&b[20..22])?;
-        let offm = digits(&b[23..25])?;
+        let offh = dec2(&b[20..22])?;
+        let offm = dec2(&b[23..25])?;
         if offh > 23 || offm > 59 {
             return None;
         }
