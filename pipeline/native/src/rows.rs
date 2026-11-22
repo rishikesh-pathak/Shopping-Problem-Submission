@@ -33,7 +33,7 @@ fn scalar<'a, const N: usize>(
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{Result, csv_input::parse_line};
+    use super::{Result, parse_line};
     use std::arch::x86_64::*;
 
     struct Row<'a, const N: usize> {
