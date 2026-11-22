@@ -1,0 +1,46 @@
+name: Verify final 60M combined fast-output variant
+on:
+  push:
+    branches:
+      - perf/radix-v3-uncompressed
+  workflow_dispatch:
+
+jobs:
+  final-scale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CPUS: '4'
+      NCPU: '4'
+      MEM: '24g'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install parquet comparison tools
+        run: python3 -m pip install --break-system-packages polars
+      - name: Generate public 60M-event dataset
+        run: |
+          mkdir -p /tmp/shop-gen
+          curl --retry 3 -fsSL https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o /tmp/shop-gen.zip
+          unzip -q /tmp/shop-gen.zip -d /tmp/shop-gen
+          GEN=$(find /tmp/shop-gen -name Cargo.toml -print -quit)
+          cargo run --release --manifest-path "$GEN" -- --seed 31 --events 60000000 --clicks 15000000 --output /tmp/shop-final
+          du -sh /tmp/shop-final
+      - name: Build hybrid image
+        run: docker build --platform linux/amd64 -t shopping-new .
+      - name: Run hybrid 60M workload and validate Parquet schema
+        run: |
+          mkdir -p /tmp/out-new
+          echo "HYBRID 60M"
+          env IMAGE=shopping-new SHOPPING_PROFILE=1 /usr/bin/time -p scripts/docker_run.sh /tmp/shop-final /tmp/out-new
+          python3 - <<'PY'
+          import polars as pl
+          for table in ("user_daily", "campaign_daily"):
+              new=pl.scan_parquet(f"/tmp/out-new/{table}/*.parquet").collect()
+              print(table, "rows", new.height, "schema", new.schema, flush=True)
+              assert new.height > 0, table
+              assert new.schema["day"] == pl.Date, table
+          print("FINAL_SCALE_OUTPUT_VALID", flush=True)
+          PY
