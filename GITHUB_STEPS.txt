@@ -1,9 +1,8 @@
-BEFORE PUBLISHING
-1. Extract this ZIP to a permanent folder. The folder containing Dockerfile is the repository root.
-2. Install/open GitHub Desktop: https://desktop.github.com/
-3. In GitHub Desktop choose File > Add Local Repository; if prompted to create a repository here, accept.
-4. Publish Repository. UNCHECK "Keep this code private". The competition requires PUBLIC.
-5. Copy the repository URL and commit SHA. Use SHOW_COMMIT_HASH.bat if Git is on PATH; or in GitHub Desktop History right-click commit and copy SHA.
-6. Open the Databricks Shopping Sessions submission page, choose your team and enter the repo and commit.
-7. Check scoring feedback for correctness, memory and official run time. Send a screenshot to ChatGPT.
-IMPORTANT: Do not upload data, downloaded answers or generated 1M-event CSVs.
+DOWNLOAD AND SUBMIT
+1. Download the ZIP or clone the public GitHub repository. The directory containing Dockerfile is the project root.
+2. To review on GitHub, compare the dedicated performance branch with main and open or review the pull request. If merging, a merge commit retains the verified revision in the repository history.
+3. Open https://www.joinbuilders.org/buildathon/tracks/shopping-sessions and select your team and the submission form.
+4. Enter the public repository URL and the full verified commit SHA. A squash merge creates a different SHA, so test that revision before using it in the form.
+5. Check the competition's correctness, memory, and timing result for the submitted SHA.
+
+Keep generated datasets, reference answers, and build outputs outside the repository.

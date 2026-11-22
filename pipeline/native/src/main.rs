@@ -8,11 +8,12 @@ use csv_input::{digits, input_files, parse_line, stamp};
 use memchr::{memchr, memchr_iter};
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap};
 use std::error::Error;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 use std::{env, fmt, io};
 
 const PARTITIONS: usize = 128;
@@ -22,16 +23,14 @@ const WEEK: i64 = 7 * DAY;
 const SESSION_GAP: i64 = 1_800_000;
 const MAX_DIMENSION_BYTES: u64 = 64 * 1024 * 1024;
 type Map<K, V> = HashMap<K, V, RandomState>;
-type Set<K> = HashSet<K, RandomState>;
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-fn profile() -> impl FnMut(&str) {
-    let enabled = env::var("SHOPPING_PROFILE").as_deref() == Ok("1");
-    let mut last = std::time::Instant::now();
+fn profile(enabled: bool) -> impl FnMut(&str) {
+    let mut last = Instant::now();
     move |label| {
         if enabled {
             eprintln!("[PROFILE] {label}: {:.3}s", last.elapsed().as_secs_f64());
-            last = std::time::Instant::now();
+            last = Instant::now();
         }
     }
 }
@@ -229,6 +228,20 @@ struct Click<'a> {
     campaign: u32,
 }
 
+struct IndexedEvent {
+    ms: i64,
+    person: u32,
+    price: u32,
+    category: u32,
+}
+
+struct IndexedClick<'a> {
+    id: &'a str,
+    ms: i64,
+    person: u32,
+    campaign: u32,
+}
+
 struct Input<'a> {
     identity: Map<&'a str, &'a str>,
     products: Map<&'a str, u32>,
@@ -300,7 +313,9 @@ impl Input<'_> {
         chunks: Vec<Vec<EventCandidate<'a>>>,
     ) -> Result<Vec<Vec<Event<'a>>>> {
         let count = chunks.iter().map(Vec::len).sum();
-        let mut earliest = Map::with_capacity_and_hasher(count, self.hash.clone());
+        // Each lane shares the partition hash's low bits. Use a separate seed
+        // so those bits don't also determine placement inside the dedup table.
+        let mut earliest = Map::with_capacity_and_hasher(count, RandomState::new());
         for EventCandidate { id, ingest, event } in chunks.into_iter().flatten() {
             match earliest.entry(id) {
                 Entry::Vacant(slot) => {
@@ -337,34 +352,19 @@ impl Input<'_> {
                 .filter(|ms| *ms >= self.start.saturating_sub(WEEK) && *ms < self.end)
                 .zip(self.campaigns.get(campaign).copied())
                 .filter(|_| !user.is_empty());
-            let (user, ms, campaign) = match valid {
-                Some((ms, campaign)) => (user, ms, campaign),
-                None => ("", 0, 0),
-            };
-            lanes[self.bucket(id)].push(Click {
-                id,
-                user,
-                ms,
-                campaign,
-            });
+            // All copies of a click have identical values. Invalid copies can
+            // be dropped here, and valid copies land in the same person lane.
+            if let Some((ms, campaign)) = valid {
+                let user = self.person(user);
+                lanes[self.bucket(user)].push(Click {
+                    id,
+                    user,
+                    ms,
+                    campaign,
+                });
+            }
             Ok(())
         })?;
-        Ok(lanes)
-    }
-
-    fn dedup_clicks<'a>(&'a self, chunks: Vec<Vec<Click<'a>>>) -> Result<Vec<Vec<Click<'a>>>> {
-        let count = chunks.iter().map(Vec::len).sum();
-        let mut ids = Set::with_capacity_and_hasher(count, self.hash.clone());
-        let mut lanes = buckets();
-        for mut click in chunks.into_iter().flatten() {
-            if !ids.insert(click.id) {
-                return Err(UseSql("duplicate click ID").into());
-            }
-            if !click.user.is_empty() {
-                click.user = self.person(click.user);
-                lanes[self.bucket(click.user)].push(click);
-            }
-        }
         Ok(lanes)
     }
 }
@@ -385,12 +385,40 @@ fn transpose<T>(chunks: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
     lanes
 }
 
-fn flatten<T>(chunks: Vec<Vec<T>>) -> Vec<T> {
-    let mut result = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
-    for mut chunk in chunks {
-        result.append(&mut chunk);
+fn index_people<'a>(
+    event_chunks: Vec<Vec<Event<'a>>>,
+    click_chunks: Vec<Vec<Click<'a>>>,
+) -> (Vec<&'a str>, Vec<IndexedEvent>, Vec<IndexedClick<'a>>) {
+    let mut names = Vec::new();
+    let mut people = Map::default();
+    let mut events = Vec::with_capacity(event_chunks.iter().map(Vec::len).sum());
+    for event in event_chunks.into_iter().flatten() {
+        let person = *people.entry(event.user).or_insert_with(|| {
+            let person = u32::try_from(names.len()).expect("too many people in one lane");
+            names.push(event.user);
+            person
+        });
+        events.push(IndexedEvent {
+            ms: event.ms,
+            person,
+            price: event.price,
+            category: event.category,
+        });
     }
-    result
+    // A person with clicks but no surviving event can never have a session.
+    let mut clicks = Vec::new();
+    if !people.is_empty() {
+        clicks.reserve(click_chunks.iter().map(Vec::len).sum());
+        clicks.extend(click_chunks.into_iter().flatten().filter_map(|click| {
+            people.get(click.user).copied().map(|person| IndexedClick {
+                id: click.id,
+                ms: click.ms,
+                person,
+                campaign: click.campaign,
+            })
+        }));
+    }
+    (names, events, clicks)
 }
 
 #[derive(Default)]
@@ -418,6 +446,62 @@ struct CampaignDay {
 
 type CampaignTotals = Map<(i32, u32), Totals>;
 
+#[derive(Default)]
+struct WorkerTimings {
+    sorting: Duration,
+    aggregation: Duration,
+    user_parquet: Duration,
+}
+
+fn sort_clicks(clicks: &mut Vec<IndexedClick<'_>>) {
+    clicks.sort_unstable_by(|a, b| {
+        a.person
+            .cmp(&b.person)
+            .then_with(|| a.ms.cmp(&b.ms))
+            .then_with(|| b.id.cmp(a.id))
+    });
+    // The ordering needed for attribution also makes identical copies adjacent.
+    clicks.dedup_by(|a, b| a.id == b.id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoted_copies_collapse_without_changing_click_precedence() {
+        let input = Input {
+            identity: Map::default(),
+            products: Map::default(),
+            campaigns: [("c1", 1), ("c2", 2)].into_iter().collect(),
+            start: 0,
+            end: 2_000,
+            unknown: 0,
+            hash: RandomState::new(),
+        };
+        let a = input
+            .clicks(b"k1,u,c1,1000\nk2,u,c2,1000\nk3,click-only,c1,1000\n")
+            .unwrap();
+        let b = input.clicks(b"\"k1\",\"u\",\"c1\",\"1000\"\n").unwrap();
+        let events = vec![vec![Event {
+            user: "u",
+            ms: 1000,
+            price: 0,
+            category: 0,
+        }]];
+        let (names, _, mut clicks) = index_people(events, a.into_iter().chain(b).collect());
+
+        sort_clicks(&mut clicks);
+
+        assert_eq!(names, ["u"]);
+        assert_eq!(
+            clicks.iter().map(|row| row.id).collect::<Vec<_>>(),
+            ["k2", "k1"]
+        );
+        assert_eq!(clicks.last().unwrap().campaign, 1);
+    }
+}
+
 fn add_user_day<'a>(
     day: &mut Option<UserDay<'a>>,
     categories: &mut Map<u32, i64>,
@@ -434,28 +518,29 @@ fn add_user_day<'a>(
 }
 
 fn aggregate<'a>(
-    mut events: Vec<Event<'a>>,
-    mut clicks: Vec<Click<'a>>,
+    events: Vec<Vec<Event<'a>>>,
+    clicks: Vec<Vec<Click<'a>>>,
     organic: u32,
     days: &mut Vec<UserDay<'a>>,
     campaign_days: &mut CampaignTotals,
+    mut timings: Option<&mut WorkerTimings>,
 ) {
-    events.sort_unstable_by(|a, b| a.user.cmp(b.user).then_with(|| a.ms.cmp(&b.ms)));
-    clicks.sort_unstable_by(|a, b| {
-        a.user
-            .cmp(b.user)
-            .then_with(|| a.ms.cmp(&b.ms))
-            .then_with(|| b.id.cmp(a.id))
-    });
+    let (names, mut events, mut clicks) = index_people(events, clicks);
+    let sorting_started = timings.as_ref().map(|_| Instant::now());
+    events.sort_unstable_by_key(|event| (event.person, event.ms));
+    sort_clicks(&mut clicks);
 
+    if let (Some(timing), Some(started)) = (&mut timings, sorting_started) {
+        timing.sorting += started.elapsed();
+    }
+    let aggregation_started = timings.as_ref().map(|_| Instant::now());
     let mut clicks = clicks.as_slice();
     let mut active = Map::<u32, usize>::default();
     let mut categories = Map::<u32, i64>::default();
-    for mut person in events.chunk_by(|a, b| a.user == b.user) {
-        let user = person[0].user;
-        let preceding = clicks.iter().take_while(|click| click.user < user).count();
-        clicks = &clicks[preceding..];
-        let n = clicks.iter().take_while(|click| click.user == user).count();
+    for mut person in events.chunk_by(|a, b| a.person == b.person) {
+        let id = person[0].person;
+        let user = names[id as usize];
+        let n = clicks.iter().take_while(|click| click.person == id).count();
         let (touches, rest) = clicks.split_at(n);
         clicks = rest;
         active.clear();
@@ -532,10 +617,14 @@ fn aggregate<'a>(
         }
         add_user_day(&mut day, &mut categories, days);
     }
+    if let (Some(timing), Some(started)) = (timings, aggregation_started) {
+        timing.aggregation += started.elapsed();
+    }
 }
 
 fn run() -> Result<()> {
-    let mut lap = profile();
+    let profiling = env::var("SHOPPING_PROFILE").as_deref() == Ok("1");
+    let mut lap = profile(profiling);
     let data = env_path("DATA_DIR", "/data");
     let out = env_path("OUTPUT_DIR", "/output");
     let threads = env_usize("NCPU", 8).max(1);
@@ -645,13 +734,9 @@ fn run() -> Result<()> {
         .par_iter()
         .map(|chunk| input.clicks(chunk))
         .collect::<Result<_>>()?;
-    let clicks = transpose(clicks)
-        .into_par_iter()
-        .map(|lane| input.dedup_clicks(lane))
-        .collect::<Result<_>>()?;
     let clicks = transpose(clicks);
 
-    lap("parse, deduplicate, and link clicks");
+    lap("parse and link clicks");
     let users_dir = out.join("user_daily");
     let campaigns_dir = out.join("campaign_daily");
     fs::create_dir_all(&users_dir)?;
@@ -669,26 +754,38 @@ fn run() -> Result<()> {
         .map(|(worker, lanes)| {
             let mut days = Vec::new();
             let mut totals = Map::default();
+            let mut timings = profiling.then(WorkerTimings::default);
             for (events, clicks) in lanes {
                 aggregate(
-                    flatten(events),
-                    flatten(clicks),
+                    events,
+                    clicks,
                     organic,
                     &mut days,
                     &mut totals,
+                    timings.as_mut(),
                 );
             }
+            let write_started = profiling.then(Instant::now);
             output::users(
                 &users_dir.join(format!("part-{worker}.parquet")),
                 &categories,
                 &days,
             )?;
-            Ok(totals)
+            if let (Some(timing), Some(started)) = (&mut timings, write_started) {
+                timing.user_parquet = started.elapsed();
+            }
+            Ok((totals, timings))
         })
         .collect::<Result<Vec<_>>>()?;
     lap("sort, sessionize, attribute, and write user Parquet");
     let mut combined = CampaignTotals::default();
-    for map in totals {
+    let mut slowest = WorkerTimings::default();
+    for (map, timings) in totals {
+        if let Some(timing) = timings {
+            slowest.sorting = slowest.sorting.max(timing.sorting);
+            slowest.aggregation = slowest.aggregation.max(timing.aggregation);
+            slowest.user_parquet = slowest.user_parquet.max(timing.user_parquet);
+        }
         for (key, totals) in map {
             let target = combined.entry(key).or_default();
             target.sessions += totals.sessions;
@@ -696,6 +793,15 @@ fn run() -> Result<()> {
             target.revenue += totals.revenue;
             target.assists += totals.assists;
         }
+    }
+    if profiling {
+        // Worker phases overlap. These maxima are useful separately and do not sum.
+        eprintln!(
+            "[PROFILE] Max worker times: sort {:.3}s, aggregate {:.3}s, user Parquet {:.3}s",
+            slowest.sorting.as_secs_f64(),
+            slowest.aggregation.as_secs_f64(),
+            slowest.user_parquet.as_secs_f64()
+        );
     }
     let rows: Vec<_> = combined
         .into_iter()
@@ -710,7 +816,9 @@ fn run() -> Result<()> {
         &campaign_names,
         &rows,
     )?;
-    output::remove_unused_user_parts(&users_dir, workers)
+    output::remove_unused_user_parts(&users_dir, workers)?;
+    lap("merge campaign totals and finish outputs");
+    Ok(())
 }
 
 fn main() -> ExitCode {

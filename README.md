@@ -1,6 +1,6 @@
 # Databricks Shopping Sessions
 
-The native Rust engine parses input in parallel, links identities, deduplicates and sessionizes events, computes attribution and assists, and writes Parquet. The image also contains the original DuckDB engine for inputs that require the general CSV reader, have ambiguous duplicates, or exceed the native memory estimate.
+The native Rust engine parses input in parallel, links identities, deduplicates events and clicks, groups events into sessions, computes attribution and assists, and writes Parquet. It sorts events and clicks by compact canonical-person indexes and coalesces identical click copies during that sort. The image also contains the original DuckDB engine for inputs that require the general CSV reader, contain conflicting copies of an event at the same ingest timestamp, or exceed the native memory estimate.
 
 ### Uploaded baseline results from the Windows laptop (2026-11-21)
 
@@ -39,8 +39,15 @@ Install Polars in the host Python environment for the comparison scripts, then r
 
 ```sh
 make fixtures
-SHOPPING_PROFILE=1 make run-dev DEV=/path/to/official/dev
+generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/shopping-dev
+SHOPPING_PROFILE=1 make run-dev DEV=/tmp/shopping-dev
 make check-dev ANSWER=/path/to/unpacked/dev-answer
 ```
 
 The test container runs as UID 1000 with networking disabled and a read-only root filesystem. The default limits are eight CPUs and 24 GB. Set `CPUS=4` if the host has a four-core quota. The image build downloads the locked Cargo dependencies and the pinned DuckDB wheel. If your build uses a TLS proxy, pass its trusted bundle with `PIP_CA=/path/to/ca-bundle.crt`. If the Docker builder is offline from crates.io, vendor dependencies on a connected machine with `cargo vendor --locked --manifest-path pipeline/native/Cargo.toml /path/to/cache/vendor`, then build with `CARGO_VENDOR=/path/to/cache`.
+
+The development check uses the competition generator and its seed-1 answer pair. Additional generator-scale checks can use seed 17 with 20M events and 5M clicks, and seed 31 with 60M events and 15M clicks. Generate those inputs outside the checkout, then time the image and inspect the engine phases with `SHOPPING_PROFILE=1 scripts/docker_run.sh INPUT_DIR OUTPUT_DIR`. Keep the engine's internal time and the Docker wrapper's wall time separate. The maximum worker timings describe overlapping work and should be read individually.
+
+### Submit a verified revision
+
+Use the public GitHub repository URL and the full SHA of the commit that passed validation. The Dockerfile lives at the repository root. See [GITHUB_STEPS.txt](GITHUB_STEPS.txt) for the branch, pull request, and submission workflow.
