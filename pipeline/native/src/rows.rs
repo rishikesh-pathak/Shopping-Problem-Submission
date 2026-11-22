@@ -6,7 +6,7 @@ pub fn for_rows<'a, const N: usize>(
     visit: impl FnMut([&'a str; N]) -> Result<()>,
 ) -> Result<()> {
     #[cfg(target_arch = "x86_64")]
-    if bytes.len() >= 32 && is_x86_feature_detected!("avx2") && bytes.is_ascii() {
+    if bytes.len() >= 32 && is_x86_feature_detected!("avx2") {
         // SAFETY: the feature check guards the vector loads and comparisons.
         // The ASCII check makes all field boundaries UTF-8 boundaries.
         return unsafe { x86::scan(bytes, visit) };
@@ -33,7 +33,7 @@ fn scalar<'a, const N: usize>(
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::Result;
+    use super::{Result, csv_input::parse_line};
     use std::arch::x86_64::*;
 
     struct Row<'a, const N: usize> {
@@ -45,6 +45,8 @@ mod x86 {
         first_quote: usize,
         last_quote: usize,
         valid: bool,
+        row_start: usize,
+        non_ascii: bool,
     }
 
     impl<'a, const N: usize> Row<'a, N> {
@@ -57,7 +59,7 @@ mod x86 {
         }
 
         fn field(&mut self, end: usize) {
-            if self.valid && self.fields < N {
+            if !self.non_ascii && self.valid && self.fields < N {
                 let bounds = match self.quotes {
                     0 => Some(self.start..end),
                     2 if self.first_quote == self.start && self.last_quote + 1 == end => {
@@ -90,13 +92,24 @@ mod x86 {
                 b'"' => self.quote(at),
                 b',' => self.field(at),
                 b'\n' => {
-                    let empty = self.fields == 0 && self.start == at;
-                    self.field(at);
-                    if !empty && self.valid && self.fields == N {
-                        visit(self.columns)?;
+                    if self.non_ascii {
+                        // Validate only rows with high bytes on the scalar path.
+                        if let Some(columns) = parse_line::<N>(&self.bytes[self.row_start..at]) {
+                            visit(columns)?;
+                        }
+                    } else {
+                        let empty = self.fields == 0 && self.start == at;
+                        self.field(at);
+                        if !empty && self.valid && self.fields == N {
+                            visit(self.columns)?;
+                        }
                     }
+                    self.row_start = at + 1;
+                    self.start = at + 1;
                     self.fields = 0;
+                    self.quotes = 0;
                     self.valid = true;
+                    self.non_ascii = false;
                 }
                 _ => {}
             }
@@ -122,6 +135,8 @@ mod x86 {
             first_quote: 0,
             last_quote: 0,
             valid: true,
+            row_start: 0,
+            non_ascii: false,
         };
         let mut base = 0;
         while bytes.len() - base >= 32 {
@@ -133,14 +148,27 @@ mod x86 {
             );
             let marks = _mm256_or_si256(comma_or_quote, _mm256_cmpeq_epi8(block, newlines));
             let mut mask = _mm256_movemask_epi8(marks) as u32;
+            let mut high = _mm256_movemask_epi8(block) as u32;
             while mask != 0 {
-                let at = base + mask.trailing_zeros() as usize;
+                let offset = mask.trailing_zeros();
+                let prefix = u32::MAX >> (31 - offset);
+                if high & prefix != 0 {
+                    row.non_ascii = true;
+                    high &= !prefix;
+                }
+                let at = base + offset as usize;
                 row.structural(bytes[at], at, &mut visit)?;
                 mask &= mask - 1;
+            }
+            if high != 0 {
+                row.non_ascii = true;
             }
             base += 32;
         }
         for (i, &byte) in bytes[base..].iter().enumerate() {
+            if !byte.is_ascii() {
+                row.non_ascii = true;
+            }
             row.structural(byte, base + i, &mut visit)?;
         }
         if bytes.last() != Some(&b'\n') {
@@ -177,5 +205,14 @@ mod tests {
             identical::<3>(input.as_bytes());
         }
         identical::<2>(b"valid,a\nan excessively long valid,field\ninvalid\xff,y\nwide,\xc3\xa9");
+        for pad in 0..64 {
+            let input = format!(
+                "{}a,b\né,x\nc,d\nbad,\u{fffd}\n\nend,last",
+                " ".repeat(pad)
+            );
+            identical::<2>(input.as_bytes());
+        }
+        identical::<2>(b"normal,ok\nnonascii,\xff\nnormal,yes\n");
+        identical::<2>("ascii,ok\naccént,yes\nascii,ok\n".as_bytes());
     }
 }
