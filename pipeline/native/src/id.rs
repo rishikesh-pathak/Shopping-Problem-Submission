@@ -16,6 +16,7 @@ pub trait Identifier<'a>: Copy + Eq + Ord + Hash + Send + Sync + 'a {
     const EMPTY: Self;
     fn encode(text: &'a str) -> std::result::Result<Self, WideIdentifier>;
     fn parquet(self) -> ByteArray;
+    fn lex_prefix(self) -> Option<u32> { None }
 }
 
 impl<'a> Identifier<'a> for &'a str {
@@ -196,10 +197,16 @@ impl<'a> Identifier<'a> for HybridId<'a> {
     };
 
     fn encode(text: &'a str) -> std::result::Result<Self, WideIdentifier> {
+        let bytes = text.as_bytes();
+        let mut prefix = [0u8; 4];
+        let n = bytes.len().min(4);
+        prefix[..n].copy_from_slice(&bytes[..n]);
         match PackedId::encode(text) {
             Ok(packed) => Ok(Self {
                 value: packed.0,
-                len_tag: 0,
+                // Cache lexicographic byte prefix in the otherwise unused
+                // compact-ID metadata word. Top bit stays clear for ASCII.
+                len_tag: u32::from_be_bytes(prefix) as u64,
                 lifetime: std::marker::PhantomData,
             }),
             Err(_) => Ok(Self {
@@ -215,6 +222,17 @@ impl<'a> Identifier<'a> for HybridId<'a> {
             ByteArray::from(self.wide())
         } else {
             PackedId(self.value).parquet()
+        }
+    }
+    fn lex_prefix(self) -> Option<u32> {
+        if !self.is_wide() {
+            Some(self.len_tag as u32)
+        } else {
+            let bytes = self.wide().as_bytes();
+            let mut prefix = [0u8; 4];
+            let n = bytes.len().min(4);
+            prefix[..n].copy_from_slice(&bytes[..n]);
+            Some(u32::from_be_bytes(prefix))
         }
     }
 }
