@@ -1,0 +1,53 @@
+name: Validate 60M final-scale hybrid pipeline
+on:
+  push:
+    branches:
+      - perf/hybrid-no-count
+  workflow_dispatch:
+
+jobs:
+  final-scale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CPUS: '4'
+      NCPU: '4'
+      MEM: '24g'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install parquet comparison tools
+        run: python3 -m pip install --break-system-packages polars
+      - name: Generate public 60M-event dataset
+        run: |
+          mkdir -p /tmp/shop-gen
+          curl --retry 3 -fsSL https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o /tmp/shop-gen.zip
+          unzip -q /tmp/shop-gen.zip -d /tmp/shop-gen
+          GEN=$(find /tmp/shop-gen -name Cargo.toml -print -quit)
+          cargo run --release --manifest-path "$GEN" -- --seed 31 --events 60000000 --clicks 15000000 --output /tmp/shop-final
+          du -sh /tmp/shop-final
+      - name: Build both images
+        run: |
+          git worktree add --detach /tmp/shop-baseline f389b6d5029f9160298318810f240f1ea2b834da
+          docker build --platform linux/amd64 -t shopping-base /tmp/shop-baseline
+          docker build --platform linux/amd64 -t shopping-new .
+      - name: Run full 60M workload and compare Parquet
+        run: |
+          mkdir -p /tmp/out-base /tmp/out-new
+          echo "BASELINE"
+          IMAGE=shopping-base time scripts/docker_run.sh /tmp/shop-final /tmp/out-base
+          echo "HYBRID"
+          IMAGE=shopping-new time scripts/docker_run.sh /tmp/shop-final /tmp/out-new
+          python3 - <<'PY'
+          import polars as pl
+          for table in ("user_daily", "campaign_daily"):
+              base=pl.scan_parquet(f"/tmp/out-base/{table}/*.parquet").collect()
+              new=pl.scan_parquet(f"/tmp/out-new/{table}/*.parquet").collect()
+              print(table, "rows", base.height, new.height, flush=True)
+              assert base.schema == new.schema, (table, base.schema, new.schema)
+              assert base.height == new.height
+              assert base.sort(base.columns).equals(new.sort(new.columns)), table
+              print("MATCH",table,flush=True)
+          PY
