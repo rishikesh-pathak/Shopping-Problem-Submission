@@ -203,6 +203,7 @@ struct Event<K> {
 
 struct EventCandidate<K> {
     id: K,
+    hash: u64,
     ingest: i64,
     event: Event<K>,
 }
@@ -287,7 +288,8 @@ impl<'a, K: Identifier<'a>> Input<'a, K> {
             }
             // Invalid payloads are still candidates for earliest ingest.
             let id = K::encode(id)?;
-            lanes[self.bucket(id)].push(EventCandidate { id, ingest, event });
+            let hash = self.hash.hash_one(id);
+            lanes[hash as usize & (PARTITIONS - 1)].push(EventCandidate { id, hash, ingest, event });
             Ok(())
         })?;
         Ok(lanes)
@@ -302,13 +304,16 @@ impl<'a, K: Identifier<'a>> Input<'a, K> {
         let count = chunks.iter().map(Vec::len).sum();
         // Each lane shares the partition hash's low bits. Use a separate seed
         // so those bits don't also determine placement inside the dedup table.
-        let mut earliest = Map::with_capacity_and_hasher(count, RandomState::new());
-        for EventCandidate { id, ingest, event } in chunks.into_iter().flatten() {
-            match earliest.entry(id) {
-                Entry::Vacant(slot) => {
-                    slot.insert((ingest, event));
+        // Events arrive with the same hash that determined their partition.
+        // Reuse it for dedup probes instead of hashing wide strings twice.
+        let mut earliest: hashbrown::HashMap<K, (i64, Event<K>), RandomState> =
+            hashbrown::HashMap::with_capacity_and_hasher(count, self.hash.clone());
+        for EventCandidate { id, hash, ingest, event } in chunks.into_iter().flatten() {
+            match earliest.raw_entry_mut().from_hash(hash, |key| *key == id) {
+                hashbrown::hash_map::RawEntryMut::Vacant(slot) => {
+                    slot.insert_hashed_nocheck(hash, id, (ingest, event));
                 }
-                Entry::Occupied(mut slot) => {
+                hashbrown::hash_map::RawEntryMut::Occupied(mut slot) => {
                     let (previous, previous_event) = slot.get();
                     if ingest == *previous && event != *previous_event {
                         return Err(UseSql("event ID and ingest timestamp tie").into());
