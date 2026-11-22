@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ahash = "0.8.12"
+hashbrown = { version = "0.16.1", features = ["raw-entry"] }
 memchr = "2.7"
 memmap2 = "0.9"
 parquet = { version = "57", default-features = false, features = ["snap"] }
