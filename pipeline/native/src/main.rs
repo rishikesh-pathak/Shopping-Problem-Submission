@@ -689,7 +689,7 @@ impl Dataset {
         let click_chunks = chunks(&self.clicks);
         // Avoid a complete scan through all input streams to count newlines.
         // We obtain exact record counts from the parsed chunks.
-        if bytes.saturating_mul(3).saturating_add(1 << 30) > memory_budget {
+        if bytes.saturating_mul(2).saturating_add(1 << 30) > memory_budget {
             return Err(UseSql("input exceeds native memory budget").into());
         }
         let identity = Links::<K>::read(&self.links)?;
@@ -745,11 +745,19 @@ impl Dataset {
             .map(|chunk| input.clicks(chunk))
             .collect::<Result<_>>()?;
         let click_rows: usize = clicks.iter().flat_map(|lanes| lanes.iter()).map(Vec::len).sum();
+        // Approximate the peak allocations of 56-byte candidates, their
+        // hash-table entries, the 48-byte click records, identity maps, and
+        // extra capacity. The old 175/130/192 coefficients unnecessarily sent
+        // final-scale inputs into the slow SQL fallback.
         let estimated = bytes
-            + event_rows as u128 * 175
-            + click_rows as u128 * 130
-            + input.identity.len() as u128 * 192
+            + event_rows as u128 * 155
+            + click_rows as u128 * 95
+            + input.identity.len() as u128 * 128
             + (1 << 30);
+        if profiling {
+            eprintln!("[PROFILE] memory: mapped={} event_rows={} click_rows={} identities={} estimate={} budget={}",
+                bytes, event_rows, click_rows, input.identity.len(), estimated, memory_budget);
+        }
         if estimated > memory_budget {
             return Err(UseSql("input exceeds native memory budget").into());
         }
