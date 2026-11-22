@@ -1,0 +1,28 @@
+name: Profile latest native 20M stages
+on:
+  push:
+    branches: [research/stage-profile]
+  workflow_dispatch:
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CPUS: '4'
+      NCPU: '4'
+      MEM: '14g'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate public 20M profile
+        run: |
+          mkdir -p /tmp/shop-gen
+          curl --retry 3 -fsSL https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o /tmp/gen.zip
+          unzip -q /tmp/gen.zip -d /tmp/shop-gen
+          GEN=$(find /tmp/shop-gen -name Cargo.toml -print -quit)
+          cargo run --release --manifest-path "$GEN" -- --seed 17 --events 20000000 --clicks 5000000 --output /tmp/shop-20m
+      - name: Build and profile optimized Rust
+        run: |
+          docker build --platform linux/amd64 -t shopping-native-profile .
+          mkdir -p /tmp/shop-output
+          env IMAGE=shopping-native-profile SHOPPING_PROFILE=1 SHOPPING_PROFILE_DETAIL=1 /usr/bin/time -p scripts/docker_run.sh /tmp/shop-20m /tmp/shop-output
