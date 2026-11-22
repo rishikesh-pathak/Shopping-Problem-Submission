@@ -306,35 +306,33 @@ impl<'a, K: Identifier<'a>> Input<'a, K> {
         mut timings: Option<&mut EventTimings>,
     ) -> Result<Vec<Vec<Event<K>>>> {
         let dedup_started = timings.as_ref().map(|_| Instant::now());
-        let count = chunks.iter().map(Vec::len).sum();
-        // Each lane shares the partition hash's low bits. Use a separate seed
-        // so those bits don't also determine placement inside the dedup table.
-        let mut earliest = Map::with_capacity_and_hasher(count, RandomState::new());
-        for EventCandidate { id, ingest, event } in chunks.into_iter().flatten() {
-            match earliest.entry(id) {
-                Entry::Vacant(slot) => {
-                    slot.insert((ingest, event));
-                }
-                Entry::Occupied(mut slot) => {
-                    let (previous, previous_event) = slot.get();
-                    if ingest == *previous && event != *previous_event {
-                        return Err(UseSql("event ID and ingest timestamp tie").into());
-                    }
-                    if ingest < *previous {
-                        slot.insert((ingest, event));
-                    }
-                }
-            }
-        }
+        // Keep event IDs together in a compact array. This is an alternative
+        // to random hash-table lookups for the first-ingest dedup rule.
+        let mut ordered = flatten(chunks);
+        ordered.sort_unstable_by(|a, b| {
+            a.id.cmp(&b.id).then_with(|| a.ingest.cmp(&b.ingest))
+        });
         if let (Some(timing), Some(started)) = (&mut timings, dedup_started) {
             timing.deduplication = started.elapsed();
         }
         let routing_started = timings.as_ref().map(|_| Instant::now());
         let mut lanes = buckets();
-        for (_, event) in earliest.into_values() {
-            if event.user != K::EMPTY {
-                let user = self.person(event.user);
-                lanes[self.bucket(user)].push(Event { user, ..event });
+        for copies in ordered.chunk_by(|a, b| a.id == b.id) {
+            let first = &copies[0];
+            for duplicate in copies.iter().skip(1) {
+                if duplicate.ingest != first.ingest {
+                    break;
+                }
+                if duplicate.event != first.event {
+                    return Err(UseSql("event ID and ingest timestamp tie").into());
+                }
+            }
+            if first.event.user != K::EMPTY {
+                let user = self.person(first.event.user);
+                lanes[self.bucket(user)].push(Event {
+                    user,
+                    ..first.event
+                });
             }
         }
         if let (Some(timing), Some(started)) = (timings, routing_started) {
