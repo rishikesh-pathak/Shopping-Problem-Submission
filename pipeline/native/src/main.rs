@@ -8,7 +8,7 @@ mod rows;
 use ahash::RandomState;
 use csv_input::{digits, input_files, stamp};
 use id::{HybridId, Identifier, WideIdentifier};
-use memchr::{memchr, memchr_iter};
+use memchr::memchr;
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use rows::for_rows;
@@ -105,13 +105,6 @@ fn read_dimension(path: &Path) -> Result<String> {
         return Err(UseSql("dimension exceeds native memory budget").into());
     }
     Ok(fs::read_to_string(path)?)
-}
-
-fn row_bound(chunks: &[&[u8]]) -> usize {
-    chunks
-        .par_iter()
-        .map(|chunk| memchr_iter(b'\n', chunk).count() + 1)
-        .sum()
 }
 
 fn dimension<'a>(csv: &'a str, expected_header: &str) -> Result<Map<&'a str, &'a str>> {
@@ -694,21 +687,11 @@ impl Dataset {
         }
         let event_chunks = chunks(&self.events);
         let click_chunks = chunks(&self.clicks);
-        let ((event_rows, click_rows), link_rows) = rayon::join(
-            || rayon::join(|| row_bound(&event_chunks), || row_bound(&click_chunks)),
-            || row_bound(&chunks(&self.links)),
-        );
-        // Allow for mapped input, per-record partition buffers, hash tables, and
-        // Parquet writers. Leave headroom for allocator and runtime overhead.
-        let estimated = bytes
-            + event_rows as u128 * 175
-            + click_rows as u128 * 130
-            + link_rows as u128 * 192
-            + (1 << 30);
-        if estimated > memory_budget {
+        // Avoid a complete scan through all input streams to count newlines.
+        // We obtain exact record counts from the parsed chunks.
+        if bytes.saturating_mul(3).saturating_add(1 << 30) > memory_budget {
             return Err(UseSql("input exceeds native memory budget").into());
         }
-        lap("count input rows and plan memory");
         let identity = Links::<K>::read(&self.links)?;
         let input = Input {
             identity,
@@ -723,10 +706,11 @@ impl Dataset {
             hash: RandomState::new(),
         };
         lap("build identity map");
-        let events = event_chunks
+        let events: Vec<Vec<Vec<EventCandidate<K>>>> = event_chunks
             .par_iter()
             .map(|chunk| input.events(chunk))
             .collect::<Result<_>>()?;
+        let event_rows: usize = events.iter().flat_map(|lanes| lanes.iter()).map(Vec::len).sum();
         lap("parse and partition events");
         let partitions = transpose(events)
             .into_par_iter()
@@ -756,12 +740,20 @@ impl Dataset {
                 event_timings.identity_lookups.as_secs_f64()
             );
         }
-        let clicks = click_chunks
+        let clicks: Vec<Vec<Vec<Click<K>>>> = click_chunks
             .par_iter()
             .map(|chunk| input.clicks(chunk))
             .collect::<Result<_>>()?;
+        let click_rows: usize = clicks.iter().flat_map(|lanes| lanes.iter()).map(Vec::len).sum();
+        let estimated = bytes
+            + event_rows as u128 * 175
+            + click_rows as u128 * 130
+            + input.identity.len() as u128 * 192
+            + (1 << 30);
+        if estimated > memory_budget {
+            return Err(UseSql("input exceeds native memory budget").into());
+        }
         let clicks = transpose(clicks);
-
         lap("parse and link clicks");
         let users_dir = out.join("user_daily");
         let campaigns_dir = out.join("campaign_daily");
