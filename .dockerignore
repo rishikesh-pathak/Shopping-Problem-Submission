@@ -1,0 +1,6 @@
+fixtures/
+dev/
+out/
+*.md
+.git
+pipeline/native/target/

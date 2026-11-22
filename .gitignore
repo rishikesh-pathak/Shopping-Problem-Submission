@@ -1,0 +1,17 @@
+# Keep competition input/output and generated artifacts out of git
+__pycache__/
+*.pyc
+*.exe
+pipeline/stage
+pipeline/native/target/
+.data/
+dev/
+dev_test_downloads/
+dev-answer/
+out/
+output/
+scratch/
+*.parquet
+*.stage
+*.zip
+.env

@@ -1,0 +1,8 @@
+DOWNLOAD AND SUBMIT
+1. Download the ZIP or clone the public GitHub repository. The directory containing Dockerfile is the project root.
+2. To review on GitHub, compare the dedicated performance branch with main and open or review the pull request. If merging, a merge commit retains the verified revision in the repository history.
+3. Open https://www.joinbuilders.org/buildathon/tracks/shopping-sessions and select your team and the submission form.
+4. Enter the public repository URL and the full verified commit SHA. A squash merge creates a different SHA, so test that revision before using it in the form.
+5. Check the competition's correctness, memory, and timing result for the submitted SHA.
+
+Keep generated datasets, reference answers, and build outputs outside the repository.
