@@ -37,9 +37,9 @@ jobs:
         run: |
           mkdir -p /tmp/out-base /tmp/out-new
           echo "BASELINE"
-          IMAGE=shopping-base time scripts/docker_run.sh /tmp/shop-final /tmp/out-base
+          env IMAGE=shopping-base /usr/bin/time -p scripts/docker_run.sh /tmp/shop-final /tmp/out-base
           echo "HYBRID"
-          IMAGE=shopping-new time scripts/docker_run.sh /tmp/shop-final /tmp/out-new
+          env IMAGE=shopping-new /usr/bin/time -p scripts/docker_run.sh /tmp/shop-final /tmp/out-new
           python3 - <<'PY'
           import polars as pl
           for table in ("user_daily", "campaign_daily"):
