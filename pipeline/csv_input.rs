@@ -33,7 +33,7 @@ fn dec2(s: &[u8]) -> Option<i64> {
     if s.len() != 2 { return None; }
     let a = s[0].wrapping_sub(b'0');
     let b = s[1].wrapping_sub(b'0');
-    if (a | b) > 9 { return None; }
+    if a > 9 || b > 9 { return None; }
     Some(i64::from(a) * 10 + i64::from(b))
 }
 fn dec4(s: &[u8]) -> Option<i64> {
